@@ -173,24 +173,56 @@ Measured on this machine, MS MARCO passage v1 (8,841,823 docs, 384 dims):
 | `np.argpartition` over 8.8M | **158 ms/call** | — |
 | mediation argpartition calls (~9k pairs × 5 worlds × 2 configs) | 90,000 | **3.9 h of pure argpartition** |
 
-**Four things break, in order of severity:**
+### 5b. Correction after measurement — the memory figure was misleading
 
-1. **Score-array caching.** `_dense_array` and `_bm25_array` memoise *full-corpus
-   float32 arrays* keyed by query string, capped at 8192 entries. At NFCorpus
-   that is 119 MB; at MS MARCO it is 290 GB each. Must become top-K caching, and
-   the top-K depth becomes part of the estimand (open decision 3).
+The 290 GB above is what the *current cache cap* would try to allocate, not what
+the experiment needs. Measured working set during a mediation query group:
 
-2. **Exhaustive dense scoring.** `dense_scores` computes `doc_emb @ vec` over the
-   entire corpus. This is what FAISS replaces. Note this changes the system, not
-   just the implementation — see decision 2.
+```
+peak distinct query score-arrays live : 4
+current cache cap                     : 8192
+```
 
-3. **`_topk_ids` argpartition.** 158 ms × 90k calls ≈ 3.9 hours of CPU that is
-   currently invisible because at 3,633 docs it costs 30 µs. Disappears with an
-   ANN index returning top-K directly.
+Four. The five freeze worlds reuse only `q0` and `q1`, for two channels. The 8192
+cap was over-provisioning that cost nothing at 3,633 docs (119 MB) and is simply
+wrong at 8.8M. Dropping it to 32 gives **2.3 GB** and loses no cache hits.
 
-4. **`dense_scores()` returning a full dict.** Builds an 8.8M-entry Python dict —
-   minutes per call and gigabytes. Only used by the public API, not the hot path,
-   but it must go.
+So memory is a one-line change, not an architecture problem. The real blocker is
+**time, and specifically top-K selection on CPU**:
+
+| operation at 8.8M | cost | total over mediation |
+|---|---|---|
+| `np.argpartition` (CPU) | 164 ms | **4.1 h** ← the actual blocker |
+| `torch.topk` (CPU) | 67 ms | 1.7 h |
+| `torch.topk` (GPU, est.) | ~3 ms | 4.5 min |
+| exhaustive dense GEMV, fp16 on A100 | 4.4 ms/query | 1.3 min* |
+
+\* only ~18k *distinct* queries need a dense array across the whole mediation
+(q0 and q1 per pair); the other 72k runs are cache hits.
+
+**Consequence: MS MARCO does not need an ANN index.** Exhaustive fp16 GEMV plus
+GPU top-K handles the full corpus in single-digit minutes. `doc_emb` at fp16 is
+6.8 GB resident, leaving ~33 GB on an A100-40 for models and activations.
+
+This is also *methodologically preferable*, and it dissolves open decision 2:
+no ANN approximation, no index build artifact to hash, no risk of silently mixing
+two index builds across runs, and "same query → same output" stays trivially
+true rather than true-by-pinned-seed.
+
+**Revised breakage list:**
+
+1. **Cache cap** — `8192` → ~32. One line. (was: "must become top-K caching")
+2. **`_topk_ids`** — must select on GPU via `torch.topk`, not `np.argpartition`.
+   This is the only genuine hot-path rewrite.
+3. **`dense_scores()` returning a full dict** — builds an 8.8M-entry Python dict;
+   minutes and gigabytes per call. Public API only, not the hot path, but it must
+   become top-K or be deleted.
+4. **`bm25_full` / `dense_full` on `PipelineResult`** — holds two full-corpus
+   arrays per result object. Fine while one result is live; fatal if any code
+   retains a list of them. Becomes top-K in the `Trace` refactor.
+
+Not needed, contrary to the original WP-3 framing: FAISS, HNSW, and the ANN
+build-config hashing that came with them.
 
 **Not a problem:** the CE pair cache, the BM25 index itself (`bm25s` is sparse),
 the corpus pickle (would need streaming, but that is routine), and the sharding
@@ -278,3 +310,42 @@ this whole refactor is validated against, and I would rather find out on day one
    composition independently of cache state, or (c) weaken the exactness claim to
    a tolerance. These have very different costs and (c) changes what the paper
    can claim. I will surface the measurement before choosing.
+
+---
+
+## 9. One dataset at a time — footprint
+
+Per-dataset embedding cache, fp16, 384 dims:
+
+| dataset | docs | embedding cache |
+|---|---|---|
+| NFCorpus | 3,633 | 3 MB |
+| SciFact | 5,183 | 4 MB |
+| SciDocs | 25,657 | 20 MB |
+| BEIR-Quora | 522,931 | 402 MB |
+| MS MARCO passage | 8,841,823 | 6.8 GB |
+| HotpotQA | 5,233,329 | 4.0 GB |
+| **all cached simultaneously** | | **11.2 GB** |
+
+TREC-DL 2019/2020 reuse the MS MARCO corpus, so they cost no extra embedding.
+
+Nothing here forces one-at-a-time on resource grounds — 11.2 GB of workspace is
+cheap and only one dataset's embeddings are ever *resident* anyway. The reasons
+to do it sequentially are operational, and they are good ones:
+
+- one config hash per run, so provenance stays unambiguous;
+- a failed dataset does not poison a multi-dataset artifact set;
+- incremental, reviewable progress (NFCorpus golden → SciFact falsification →
+  the rest), with a checkpoint after each;
+- GPU memory stays predictable: one `doc_emb` resident per worker, 6.8 GB worst
+  case, leaving ~33 GB on an A100-40.
+
+Recommended order, cheapest-and-most-informative first: **NFCorpus** (golden,
+already passing) → **SciFact** (falsification test; 4 MB, minutes) → **TREC-DL**
+(needs the MS MARCO corpus, so it forces the scale work) → **MS MARCO dev** →
+**Quora** → **HotpotQA** (WP-7 only).
+
+Putting SciFact second is deliberate: it is the cheapest dataset in the set *and*
+the one that can falsify the architectural claim. If the mediation shares do not
+shift there, that is worth knowing before building any scale infrastructure at
+all.
