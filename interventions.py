@@ -107,7 +107,15 @@ def sample_treatment_terms(
     intervention would be a no-op on the lexical channel.
     """
     terms, w = tfidf_terms(corpus, doc_id, vs)
-    keep = [j for j, t in enumerate(terms) if t not in query_tokens]
+    # Exclude on stems too: injecting a term that stems to something already in
+    # the query is close to a no-op on the lexical channel, which would dilute
+    # the treatment arm the mirror-image way the control leak inflated it.
+    qstems = set(stem(sorted(query_tokens))) if query_tokens else set()
+    keep = [
+        j
+        for j, t in enumerate(terms)
+        if t not in query_tokens and stem([t])[0] not in qstems
+    ]
     if not keep:
         return []
     terms = [terms[j] for j in keep]
@@ -120,14 +128,39 @@ def sample_treatment_terms(
     return [terms[j] for j in idx]
 
 
+_STEMMER = None
+
+
+def stem(words: list[str]) -> list[str]:
+    """Snowball stems, matching what the BM25 index actually stores."""
+    global _STEMMER
+    if _STEMMER is None:
+        import Stemmer
+
+        _STEMMER = Stemmer.Stemmer("english")
+    return _STEMMER.stemWords(words)
+
+
 def sample_control_terms(
     doc_tokens: frozenset[str],
     query_tokens: set[str],
     vs: VocabStats,
     rng: np.random.Generator,
     n: int = config.N_CONTROL_TERMS,
+    doc_stems: frozenset[str] = frozenset(),
+    query_stems: frozenset[str] = frozenset(),
 ) -> list[str]:
-    """Sample ``n`` corpus-vocabulary terms absent from both query and document."""
+    """Sample ``n`` corpus terms absent from both query and document.
+
+    Absence is checked **on stems, not surface forms**. The BM25 index is built
+    with a Snowball stemmer, so a control term whose stem collides with a
+    document term contributes real lexical mass to that document's score - the
+    control arm would then contain weak treatments and the treatment-vs-control
+    contrast would be biased toward zero. Rejecting on surface form alone let
+    through pairs like model/models, fruit/fruits and
+    supplementation/supplements, which measurably lifted the control arm's
+    Delta-BM25 off zero (2.7% of sampled control terms on NFCorpus).
+    """
     out: list[str] = []
     pool = vs.control_pool
     for _ in range(50 * n):
@@ -135,6 +168,9 @@ def sample_control_terms(
             break
         t = pool[int(rng.integers(len(pool)))]
         if t in doc_tokens or t in query_tokens or t in out:
+            continue
+        s = stem([t])[0]
+        if s in doc_stems or s in query_stems:
             continue
         out.append(t)
     return out
@@ -188,6 +224,7 @@ def run_interventions(
         run = baseline[qid]
         q0 = run.query_text
         qtok = set(content_tokens(q0))
+        qstems = frozenset(stem(sorted(qtok))) if qtok else frozenset()
         rel = queries.relevant(qid)
         # Per-query RNG: reproducible, independent of iteration order, and
         # identical whether this query is processed by a single-process run or
@@ -203,10 +240,12 @@ def run_interventions(
             cov = pipe.covariates(q0, doc_id)
             prov = run.provenance.get(doc_id, "none")
 
+            dtok = corpus.doc_content_tokens[corpus.idx(doc_id)]
+            dstems = frozenset(stem(sorted(dtok))) if dtok else frozenset()
             arms = {
                 "treatment": sample_treatment_terms(corpus, doc_id, qtok, vs, rng),
                 "control": sample_control_terms(
-                    corpus.doc_content_tokens[corpus.idx(doc_id)], qtok, vs, rng
+                    dtok, qtok, vs, rng, doc_stems=dstems, query_stems=qstems
                 ),
             }
             for arm, terms in arms.items():
