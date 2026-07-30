@@ -1,0 +1,40 @@
+# A100 / CUDA environment (Linux, Python 3.11+).
+#
+# Install torch FIRST from the CUDA index, then the rest:
+#
+#   uv venv --python 3.11 .venv
+#   VIRTUAL_ENV=.venv uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   VIRTUAL_ENV=.venv uv pip install -r requirements-gpu.txt
+#
+# The macOS x86_64 pins in requirements.txt (torch==2.2.2 and the
+# transformers/sentence-transformers versions it forces) do NOT apply here -
+# that ceiling exists only because PyTorch stopped shipping macOS Intel wheels
+# after 2.2.2. On Linux+CUDA use current versions.
+
+torch>=2.4                    # any CUDA build; install from the cu12x index
+transformers>=4.44,<5         # 5.x needs torch>=2.5; 4.x keeps parity with the CPU run
+sentence-transformers>=3.0,<4
+tokenizers<0.21
+huggingface-hub<1.0
+
+# --- pinned for a real incompatibility, not caution ---
+# doubleml 0.10.1 calls sklearn.utils.validation.check_X_y(force_all_finite=...),
+# which was deprecated in scikit-learn 1.6 and REMOVED in 1.9. Anything >=1.9
+# fails at DoubleMLPLR.fit() with a TypeError.
+scikit-learn==1.7.2
+doubleml==0.10.1
+
+lightgbm>=4.3
+statsmodels>=0.14
+numpy<2
+scipy>=1.11
+pandas>=2.2
+pyarrow>=15
+matplotlib>=3.8
+ir_datasets>=0.5.5
+bm25s>=0.2
+PyStemmer>=2.2
+
+# CPU-only extra: the ONNX cross-encoder path is skipped on CUDA, so this is
+# optional on a GPU box. Harmless to install.
+# onnxruntime>=1.17
