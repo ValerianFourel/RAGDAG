@@ -100,6 +100,7 @@ def sample_treatment_terms(
     vs: VocabStats,
     rng: np.random.Generator,
     n: int = config.N_TREATMENT_TERMS,
+    query_bm25: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Sample ``n`` terms from the target document, TF-IDF weighted.
 
@@ -107,14 +108,14 @@ def sample_treatment_terms(
     intervention would be a no-op on the lexical channel.
     """
     terms, w = tfidf_terms(corpus, doc_id, vs)
-    # Exclude on stems too: injecting a term that stems to something already in
-    # the query is close to a no-op on the lexical channel, which would dilute
-    # the treatment arm the mirror-image way the control leak inflated it.
-    qstems = set(stem(sorted(query_tokens))) if query_tokens else set()
+    # Exclude against the BM25 view of the query, not just its surface tokens:
+    # injecting a term the query already contributes is close to a no-op on the
+    # lexical channel, diluting the treatment arm the mirror-image way the
+    # stopword/stem mismatch inflated the control arm.
     keep = [
         j
         for j, t in enumerate(terms)
-        if t not in query_tokens and stem([t])[0] not in qstems
+        if t not in query_tokens and not (bm25_terms(t) & query_bm25)
     ]
     if not keep:
         return []
@@ -129,6 +130,7 @@ def sample_treatment_terms(
 
 
 _STEMMER = None
+_BM25_TOK_CACHE: dict[str, frozenset[str]] = {}
 
 
 def stem(words: list[str]) -> list[str]:
@@ -141,27 +143,62 @@ def stem(words: list[str]) -> list[str]:
     return _STEMMER.stemWords(words)
 
 
+def bm25_terms(text: str) -> frozenset[str]:
+    """Exactly the terms BM25 will score for ``text``.
+
+    This is the ground truth for "does this term touch that document's BM25
+    score", and it is *not* the same as stopword-filtered stems: the project's
+    covariate tokeniser uses scikit-learn's stopword list (318 words) while the
+    BM25 index uses bm25s' (33). The 285-word gap contains ordinary words -
+    have, about, between, back - which BM25 indexes and scores but which the
+    covariate view discards. Approximating with the wrong filter is what let
+    control term "having" (stem "have") move a document's BM25 score.
+    """
+    global _STEMMER
+    hit = _BM25_TOK_CACHE.get(text)
+    if hit is not None:
+        return hit
+    import bm25s
+
+    if _STEMMER is None:
+        stem(["x"])
+    toks = bm25s.tokenize(
+        text, stopwords="en", stemmer=_STEMMER, return_ids=False, show_progress=False
+    )[0]
+    out = frozenset(toks)
+    if len(_BM25_TOK_CACHE) > 20000:
+        _BM25_TOK_CACHE.clear()
+    _BM25_TOK_CACHE[text] = out
+    return out
+
+
 def sample_control_terms(
     doc_tokens: frozenset[str],
     query_tokens: set[str],
     vs: VocabStats,
     rng: np.random.Generator,
     n: int = config.N_CONTROL_TERMS,
-    doc_stems: frozenset[str] = frozenset(),
-    query_stems: frozenset[str] = frozenset(),
+    doc_bm25: frozenset[str] = frozenset(),
+    query_bm25: frozenset[str] = frozenset(),
 ) -> list[str]:
-    """Sample ``n`` corpus terms absent from both query and document.
+    """Sample ``n`` corpus terms that cannot touch the document's BM25 score.
 
-    Absence is checked **on stems, not surface forms**. The BM25 index is built
-    with a Snowball stemmer, so a control term whose stem collides with a
-    document term contributes real lexical mass to that document's score - the
-    control arm would then contain weak treatments and the treatment-vs-control
-    contrast would be biased toward zero. Rejecting on surface form alone let
-    through pairs like model/models, fruit/fruits and
-    supplementation/supplements, which measurably lifted the control arm's
-    Delta-BM25 off zero (2.7% of sampled control terms on NFCorpus).
+    Absence is decided with **the BM25 tokeniser itself** - same stopword list,
+    same stemmer, same regex as the index - rather than with an approximation.
+    Anything less exact has failed twice here:
+
+    * surface-form matching let model/models and fruit/fruits through
+      (2.7% of control terms);
+    * stem matching over scikit-learn's stopword list still let "having"
+      through, because sklearn strips 318 words and bm25s only 33, so ordinary
+      indexed terms were invisible to the filter (1 in 4500).
+
+    A control term that survives this check provably contributes zero to the
+    target document's BM25 score, which is the invariant the whole
+    treatment-versus-control contrast rests on.
     """
     out: list[str] = []
+    forbidden = doc_bm25 | query_bm25
     pool = vs.control_pool
     for _ in range(50 * n):
         if len(out) == n:
@@ -169,8 +206,7 @@ def sample_control_terms(
         t = pool[int(rng.integers(len(pool)))]
         if t in doc_tokens or t in query_tokens or t in out:
             continue
-        s = stem([t])[0]
-        if s in doc_stems or s in query_stems:
+        if bm25_terms(t) & forbidden:
             continue
         out.append(t)
     return out
@@ -224,7 +260,7 @@ def run_interventions(
         run = baseline[qid]
         q0 = run.query_text
         qtok = set(content_tokens(q0))
-        qstems = frozenset(stem(sorted(qtok))) if qtok else frozenset()
+        qbm25 = bm25_terms(q0)
         rel = queries.relevant(qid)
         # Per-query RNG: reproducible, independent of iteration order, and
         # identical whether this query is processed by a single-process run or
@@ -241,11 +277,13 @@ def run_interventions(
             prov = run.provenance.get(doc_id, "none")
 
             dtok = corpus.doc_content_tokens[corpus.idx(doc_id)]
-            dstems = frozenset(stem(sorted(dtok))) if dtok else frozenset()
+            dbm25 = bm25_terms(corpus.texts[corpus.idx(doc_id)])
             arms = {
-                "treatment": sample_treatment_terms(corpus, doc_id, qtok, vs, rng),
+                "treatment": sample_treatment_terms(
+                    corpus, doc_id, qtok, vs, rng, query_bm25=qbm25
+                ),
                 "control": sample_control_terms(
-                    dtok, qtok, vs, rng, doc_stems=dstems, query_stems=qstems
+                    dtok, qtok, vs, rng, doc_bm25=dbm25, query_bm25=qbm25
                 ),
             }
             for arm, terms in arms.items():

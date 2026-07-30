@@ -489,12 +489,24 @@ def build_report(path=REPORT_PATH) -> str:
 
     # ---- limitations ----
     add("## Limitations\n")
+    _full_design = config.K_CANDIDATES >= 50 and config.MAX_TARGET_DOCS_PER_QUERY >= 10
+    if _full_design:
+        add(
+            f"- **Scale.** This run used the full design: top-{config.K_CANDIDATES} per "
+            f"channel, up to {config.MAX_TARGET_DOCS_PER_QUERY} target documents per "
+            f"query, cross-encoder sequence length {config.CE_MAX_LENGTH}, all "
+            f"{a.ndcg['n_queries'] if a.ndcg else 323} queries. No compute reductions "
+            "were applied.\n"
+        )
+    else:
+        add(
+            f"- **Compute budget.** The candidate pool is top-{config.K_CANDIDATES} per "
+            f"channel and at most {config.MAX_TARGET_DOCS_PER_QUERY} target documents "
+            "per query, reduced from the design's 50/10 to fit a CPU-only machine. All "
+            "queries are retained, so the number of bootstrap clusters is unaffected; "
+            "the narrower pool does compress the range of measurable rank movement.\n"
+        )
     add(
-        f"- **Compute budget.** The candidate pool is top-{config.K_CANDIDATES} per "
-        f"channel and at most {config.MAX_TARGET_DOCS_PER_QUERY} target documents per "
-        "query, reduced from the design's 50/10 to fit a CPU-only machine. All 323 "
-        "queries are retained, so the number of bootstrap clusters is unaffected; the "
-        "narrower pool does compress the range of measurable rank movement.\n"
         f"- **Censored outcome.** Rank is truncated at {config.MISSING_RANK}, so large "
         "displacements are recorded as equal. Path effects are correspondingly "
         "conservative.\n"

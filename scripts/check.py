@@ -170,33 +170,52 @@ def _ndcg():
     return True, detail
 
 
-@check("control arm delta-BM25 is exactly 0")
+@check("control arm cannot touch BM25")
 def _ctrl():
-    """The control term is absent from the target document *after stemming*, so
-    that document's BM25 score cannot move. A non-zero value means the term
-    sampler is leaking weak treatments into the control arm."""
+    """A control term must contribute exactly zero to the target document's BM25
+    score - that invariant is what the treatment-vs-control contrast rests on.
+
+    Checked against the BM25 tokeniser itself rather than by scoring a sample.
+    Scoring is the weaker test: the last leak occurred in 1 of 4500 control
+    terms, so a 12-query preflight would pass it roughly 99.7% of the time and
+    report a false all-clear. Set-intersection over the real tokenisation is
+    deterministic and catches it on the first offending term.
+    """
     import numpy as np
 
     import interventions as I
 
     vs = I.build_vocab_stats(_corpus)
-    worst, n = 0.0, 0
-    for qid in _qids:
-        run = _base[qid]
-        qtok = set(content_tokens(run.query_text))
-        qs = frozenset(I.stem(sorted(qtok))) if qtok else frozenset()
+    bad, n, worst = [], 0, 0.0
+    # Sweep every query, not just the preflight subset: sampling is cheap
+    # without the cross-encoder, and rare leaks are the whole point.
+    for qid in select_queries(_queries):
+        q0 = _queries.texts[qid]
+        ba = _pipe._bm25_array(q0)
+        cands, _ = _pipe.candidates(ba, _pipe._dense_array(q0))
+        elig = sorted(set(cands) & _queries.relevant(qid))
         rng = np.random.default_rng(config.stable_seed(qid))
-        for d in I.select_targets(run, _queries.relevant(qid), rng):
+        if len(elig) > config.MAX_TARGET_DOCS_PER_QUERY:
+            idx = rng.choice(len(elig), size=config.MAX_TARGET_DOCS_PER_QUERY, replace=False)
+            elig = [elig[j] for j in sorted(idx)]
+        qtok = set(content_tokens(q0))
+        qbm = I.bm25_terms(q0)
+        for d in elig:
             di = _corpus.idx(d)
             dtok = _corpus.doc_content_tokens[di]
-            ds = frozenset(I.stem(sorted(dtok))) if dtok else frozenset()
-            I.sample_treatment_terms(_corpus, d, qtok, vs, rng)  # keep RNG in step
-            for t in I.sample_control_terms(dtok, qtok, vs, rng, doc_stems=ds, query_stems=qs):
-                base = run.bm25_scores_cand.get(d, 0.0)
-                new = float(_pipe._bm25_array(f"{run.query_text} {t}")[di])
-                worst = max(worst, abs(new - base))
+            dbm = I.bm25_terms(_corpus.texts[di])
+            I.sample_treatment_terms(_corpus, d, qtok, vs, rng, query_bm25=qbm)
+            for t in I.sample_control_terms(
+                dtok, qtok, vs, rng, doc_bm25=dbm, query_bm25=qbm
+            ):
                 n += 1
-    return worst == 0.0, f"max |delta| over {n} control terms = {worst:.2e}"
+                if I.bm25_terms(t) & (dbm | qbm):
+                    bad.append(t)
+                    worst = max(worst, abs(float(_pipe._bm25_array(f"{q0} {t}")[di]) - float(ba[di])))
+    detail = f"{len(bad)} leak(s) in {n} control terms"
+    if bad:
+        detail += f" (e.g. {bad[0]!r}, max |dBM25| = {worst:.3f})"
+    return not bad, detail
 
 
 @check("BM25 is order-invariant under shuffle")
