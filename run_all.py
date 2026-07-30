@@ -83,6 +83,7 @@ def _fmt(s: float) -> str:
 def current_meta() -> dict:
     """Config fingerprint. A change here invalidates cached artefacts."""
     return {
+        "dataset": config.DATASET,
         "n_queries": config.N_QUERIES,
         "k_candidates": config.K_CANDIDATES,
         "k_final": config.K_FINAL,

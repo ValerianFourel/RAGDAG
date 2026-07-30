@@ -43,7 +43,9 @@ SEED: int = 42
 # --------------------------------------------------------------------------- #
 # Dataset
 # --------------------------------------------------------------------------- #
-DATASET: str = "beir/nfcorpus/test"
+#: ir_datasets identifier. Override with the ``DATASET`` env var; every cache
+#: key and the run metadata are scoped by it, so switching is safe.
+DATASET: str = os.environ.get("DATASET", "beir/nfcorpus/test").strip()
 
 #: Number of queries to run. ``None`` means "all 323 test queries".
 #: Override with the ``N_QUERIES`` environment variable for smoke tests.
@@ -243,11 +245,20 @@ PRECISION_TAG: str = "fp16" if USE_FP16 else ("tf32" if ALLOW_TF32 else "fp32")
 #: the GPU profile (512 / 512) would reuse the short-sequence embeddings and
 #: cross-encoder scores and silently mix two different models' outputs.
 _DENSE_TAG: str = DENSE_MODEL.split("/")[-1]
+
+#: Every cache key is dataset-scoped. Without this, `load_corpus_and_queries`
+#: checks `CORPUS_CACHE.exists()` *before* the dataset string is ever read, so
+#: switching DATASET silently returns the previously cached corpus AND its
+#: queries - a complete substitution that runs to completion and reports wrong
+#: numbers without erroring.
+DATASET_TAG: str = DATASET.replace("/", "-")
+
 EMBEDDINGS_CACHE: Path = (
-    CACHE_DIR / f"doc_emb_{_DENSE_TAG}_L{MAX_SEQ_LENGTH}_{PRECISION_TAG}.npz"
+    CACHE_DIR
+    / f"doc_emb_{DATASET_TAG}_{_DENSE_TAG}_L{MAX_SEQ_LENGTH}_{PRECISION_TAG}.npz"
 )
-BM25_INDEX_CACHE: Path = CACHE_DIR / "bm25_index"
-CORPUS_CACHE: Path = CACHE_DIR / "corpus.pkl"
+BM25_INDEX_CACHE: Path = CACHE_DIR / f"bm25_{DATASET_TAG}"
+CORPUS_CACHE: Path = CACHE_DIR / f"corpus_{DATASET_TAG}.pkl"
 
 
 def baseline_cache_path(qids: list[str]) -> Path:
@@ -261,9 +272,28 @@ def baseline_cache_path(qids: list[str]) -> Path:
         "\n".join(sorted(qids)).encode(), digest_size=6
     ).hexdigest()
     return CACHE_DIR / (
-        f"baseline_n{len(qids)}_{digest}_k{K_CANDIDATES}"
+        f"baseline_{DATASET_TAG}_n{len(qids)}_{digest}_k{K_CANDIDATES}"
         f"_ce{CE_MAX_LENGTH}_d{MAX_SEQ_LENGTH}_{PRECISION_TAG}.pkl"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Per-dataset baseline expectations (WP-4 gate, as data rather than prose)
+# --------------------------------------------------------------------------- #
+#: dataset -> (min, max) for full-pipeline nDCG@10 under *this* profile.
+#: ``None`` means "no expectation recorded yet"; the run reports the observed
+#: value and applies only the universal broken-pipeline floor. Fill in after the
+#: first clean run on a dataset rather than guessing a range up front.
+BASELINE_EXPECTATIONS: dict[str, tuple[float, float] | None] = {
+    "beir/nfcorpus/test": (0.33, 0.38),   # observed 0.3568 at K=50/ce512
+    "beir/scifact/test": None,
+    "beir/scidocs": None,
+    "beir/quora/test": None,
+    "beir/fiqa/test": None,
+}
+
+#: Universal floor. Below this the pipeline is broken on any collection.
+BASELINE_FLOOR: float = 0.15
 
 
 # --------------------------------------------------------------------------- #

@@ -149,9 +149,13 @@ def criterion_mediation(a: Artifacts) -> Criterion:
 
 def criterion_confounding(a: Artifacts) -> Criterion:
     """C3: at least one concept whose naive estimate sits outside the DML CI."""
-    if a.dml is None or a.dml.empty:
-        return Criterion("CONFOUNDING IS LIVE", "INCONCLUSIVE",
-                         "dml_comparison.csv missing", "Module 4 did not run.")
+    if a.dml is None or a.dml.empty or "naive_outside_dml_ci" not in a.dml.columns:
+        return Criterion(
+            "CONFOUNDING IS LIVE", "INCONCLUSIVE",
+            "no concept estimates available",
+            "Module 4 produced no concepts on this collection - most likely the "
+            "medical lexicon does not intersect this corpus. Absence of estimates "
+            "is not evidence of no confounding.")
     hits = a.dml[a.dml["naive_outside_dml_ci"]]
     ok = len(hits) > 0
     names = ", ".join(f"'{r.concept}'" for r in hits.itertuples()) or "none"

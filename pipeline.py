@@ -244,9 +244,12 @@ def load_corpus_and_queries() -> tuple[Corpus, Queries]:
 
     doc_ids: list[str] = []
     texts: list[str] = []
+    # BEIR doc schemas differ: nfcorpus has (doc_id, text, title, url), scifact
+    # (doc_id, text, title), quora and fiqa have no title at all. Access
+    # defensively so a schema difference is a no-op rather than an AttributeError.
     for d in ds.docs_iter():
-        title = (d.title or "").strip()
-        body = (d.text or "").strip()
+        title = (getattr(d, "title", "") or "").strip()
+        body = (getattr(d, "text", "") or "").strip()
         doc_ids.append(d.doc_id)
         texts.append(f"{title} {body}".strip())
 
@@ -774,23 +777,48 @@ def baseline_sanity_check(
         "dense_only": float(np.mean(n_d)),
         "full_pipeline": float(np.mean(n_f)),
         "n_queries": len(runs),
+        "dataset": config.DATASET,
     }
+    full = out["full_pipeline"]
+    best_single = max(out["bm25_only"], out["dense_only"])
     print("\n" + "=" * 62)
-    print("BASELINE SANITY CHECK - nDCG@10 on NFCorpus test")
+    print(f"BASELINE SANITY CHECK - nDCG@10 on {config.DATASET}")
     print("=" * 62)
     print(f"  BM25 only      : {out['bm25_only']:.4f}")
     print(f"  Dense only     : {out['dense_only']:.4f}")
-    print(f"  Full pipeline  : {out['full_pipeline']:.4f}")
+    print(f"  Full pipeline  : {full:.4f}")
     print(f"  queries        : {out['n_queries']}")
-    if out["full_pipeline"] <= max(out["bm25_only"], out["dense_only"]):
+
+    expected = config.BASELINE_EXPECTATIONS.get(config.DATASET)
+    if expected is None:
+        print(
+            f"  NOTE: no recorded expectation for {config.DATASET}. Applying the "
+            f"universal floor ({config.BASELINE_FLOOR}) only; record "
+            f"{full:.4f} in config.BASELINE_EXPECTATIONS after inspecting this run."
+        )
+        out["expectation"] = None
+    else:
+        lo, hi = expected
+        out["expectation"] = [lo, hi]
+        if not (lo <= full <= hi):
+            print(
+                f"  WARNING: full-pipeline nDCG@10 {full:.4f} is outside the "
+                f"recorded range [{lo}, {hi}] for this dataset. A quality "
+                "regression invalidates every downstream causal number."
+            )
+        else:
+            print(f"  within recorded range [{lo}, {hi}]")
+
+    if full <= best_single:
         print(
             "  WARNING: full pipeline does NOT beat both single channels - "
-            "the reranker may be mis-wired."
+            "the reranker may be mis-wired (or this collection favours one "
+            "channel strongly; check before trusting the mediation shares)."
         )
-    if out["full_pipeline"] < 0.15:
+    if full < config.BASELINE_FLOOR:
         print(
-            "  WARNING: full-pipeline nDCG@10 < 0.15, far below the ~0.35 "
-            "expected on NFCorpus. Investigate before running modules 2-5."
+            f"  WARNING: full-pipeline nDCG@10 < {config.BASELINE_FLOOR}. "
+            "Investigate before running modules 2-5."
         )
     print("=" * 62 + "\n")
     return out

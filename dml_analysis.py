@@ -110,6 +110,19 @@ def select_concepts(
     ]
     band.sort(key=lambda x: (-x[1], x[0]))
     chosen = band[:n]
+    if not chosen:
+        # MEDICAL_LEXICON is NFCorpus-specific. On a non-biomedical collection
+        # the intersection is empty and every downstream table would be silently
+        # blank rather than absent. Say so loudly; WP-6 replaces the lexicon
+        # with a frequency-stratified vocabulary sample.
+        print(
+            f"[dml] WARNING: no concept terms found for {config.DATASET}. The "
+            f"medical lexicon ({len(MEDICAL_LEXICON)} terms) does not intersect "
+            f"this corpus in the df band [{config.DML_DF_MIN:.0%}, "
+            f"{config.DML_DF_MAX:.0%}]. Module 4 will be reported as "
+            "INCONCLUSIVE, not as a null result."
+        )
+        return []
     print(
         f"[dml] concept terms chosen (df in [{config.DML_DF_MIN:.0%}, "
         f"{config.DML_DF_MAX:.0%}], medical lexicon): "
@@ -276,6 +289,9 @@ def analyse(df: pd.DataFrame, concepts: list[tuple[str, float]]) -> pd.DataFrame
 
 def print_comparison(res: pd.DataFrame) -> bool:
     """Print the side-by-side table and return whether confounding was found."""
+    if res is None or res.empty:
+        print("\n[dml] no concepts analysed - Module 4 produced no estimates.")
+        return False
     print("\n" + "=" * 96)
     print("DOUBLE MACHINE LEARNING - naive vs confounder-adjusted concept effect")
     print("outcome Y = cross-encoder score;  treatment D = document contains concept")

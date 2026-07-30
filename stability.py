@@ -42,6 +42,10 @@ OUT_PARQUET = config.RESULTS_DIR / "stability_per_query.parquet"
 FIG_STABILITY = config.RESULTS_DIR / "fig_stability.png"
 
 VARIANTS = ["destop", "shuffle", "synonym"]
+
+#: A variant that leaves at least this fraction of queries textually unchanged is
+#: degenerate: its RBO is ~1 by construction, not by pipeline stability.
+DEGENERATE_NOOP_FRAC: float = 0.80
 CONFIGS = ["bm25_only", "dense_only", "full"]
 
 #: Hand-rolled meaning-preserving substitutions. Kept deliberately small and
@@ -354,6 +358,13 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     g = g.merge(gc, on=["variant", "config"], how="left")
     g["instability"] = 1.0 - g["mean_rbo"]
     g["instability_changed"] = 1.0 - g["mean_rbo_changed"]
+    # A rewriter that edits almost nothing yields RBO ~= 1 by construction, which
+    # reads as "the pipeline is stable" when it means "the rewrite was a no-op".
+    # SYNONYMS is a hand-written medical list, so this is the expected failure
+    # mode off-domain. Flag it rather than letting it masquerade as a result.
+    noop = df.groupby("variant")["unchanged_text"].mean()
+    g["frac_noop"] = g["variant"].map(noop)
+    g["degenerate"] = g["frac_noop"] >= DEGENERATE_NOOP_FRAC
     return g
 
 
@@ -388,6 +399,13 @@ def print_summary(summ: pd.DataFrame, df: pd.DataFrame) -> None:
     noop = df.groupby("variant")["unchanged_text"].mean()
     print("  Fraction of queries the rewrite left textually unchanged: " +
           ", ".join(f"{k}={v:.0%}" for k, v in noop.items()))
+    degen = sorted({r["variant"] for _, r in summ.iterrows() if r.get("degenerate")})
+    if degen:
+        print(
+            f"  DEGENERATE VARIANT(S): {', '.join(degen)} left >= "
+            f"{DEGENERATE_NOOP_FRAC:.0%} of queries unchanged. Their RBO is ~1 by "
+            "construction, NOT evidence of stability - do not report them as such."
+        )
     print("=" * 84 + "\n")
 
 
