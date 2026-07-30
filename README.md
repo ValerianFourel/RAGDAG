@@ -69,21 +69,25 @@ ws_allocate ragdag 30                       # workspace; $HOME is quota'd
 export RAGDAG_WS=$(ws_find ragdag)
 cd "$RAGDAG_WS" && git clone https://github.com/ValerianFourel/RAGDAG.git && cd RAGDAG
 
-module avail python 2>&1 | head            # find the Python 3.11+ module
-module load devel/python/3.11              # adjust to what's actually there
-python -m venv .venv && source .venv/bin/activate
-pip install -U pip
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements-gpu.txt
-
-export HF_HOME="$RAGDAG_WS/hf" IR_DATASETS_HOME="$RAGDAG_WS/ir_datasets"
-python scripts/prefetch.py                 # ~1 min; downloads models + NFCorpus
+bash scripts/setup_login.sh                 # venv + deps + prefetch, ~3 min
 
 # ── submit ────────────────────────────────────────────────────────────────
 sbatch --export=ALL,RAGDAG_WS="$RAGDAG_WS",N_QUERIES=30 \
        --partition=dev_accelerated --time=00:30:00 scripts/horeka.sbatch   # smoke
 sbatch --export=ALL,RAGDAG_WS="$RAGDAG_WS" scripts/horeka.sbatch           # full
 ```
+
+**Do not use the module system for Python here.** `devel/python/3.11` does not
+exist on HoreKa, and a failed `module load` leaves you on the system Python
+**3.9** — where `pip install -r requirements-gpu.txt` aborts at the first pin
+requiring ≥3.10 and installs *nothing*. That surfaces as a dozen unrelated
+`ModuleNotFoundError`s that look like a broken requirements file. `config.py`
+now refuses to import below 3.10 with instructions, and `setup_login.sh` fetches
+a standalone CPython 3.11 through `uv`, needing no modules at all.
+
+One more trap: the package is **`PyStemmer`**, not `Stemmer`. `pip install
+Stemmer` installs an unrelated stub that does not provide the `Stemmer` module
+this code imports, and the `ModuleNotFoundError` does not change.
 
 Then `squeue --me`, and read the verdict from the end of the job log or
 `results/REPORT.md`.

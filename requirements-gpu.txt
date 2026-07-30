@@ -1,39 +1,49 @@
-# A100 / CUDA environment (Linux, Python 3.11+).
+# A100 / CUDA environment. REQUIRES PYTHON >= 3.10 (3.11 recommended).
 #
-# Install torch FIRST from the CUDA index, then the rest:
+# If `pip install -r` on this file reports "Could not find a version that
+# satisfies scikit-learn" or similar, check `python -V` FIRST. On Python 3.9 pip
+# aborts the whole file at the first unsatisfiable pin and installs nothing,
+# which then looks like a dozen unrelated ModuleNotFoundErrors.
 #
-#   uv venv --python 3.11 .venv
-#   VIRTUAL_ENV=.venv uv pip install torch --index-url https://download.pytorch.org/whl/cu124
-#   VIRTUAL_ENV=.venv uv pip install -r requirements-gpu.txt
+# Install order (login node, with internet):
 #
-# The macOS x86_64 pins in requirements.txt (torch==2.2.2 and the
-# transformers/sentence-transformers versions it forces) do NOT apply here -
-# that ceiling exists only because PyTorch stopped shipping macOS Intel wheels
-# after 2.2.2. On Linux+CUDA use current versions.
+#   curl -LsSf https://astral.sh/uv/install.sh | sh     # standalone CPython,
+#   export PATH="$HOME/.local/bin:$PATH"                # no module system needed
+#   uv venv --python 3.11 .venv && source .venv/bin/activate
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   uv pip install -r requirements-gpu.txt
+#
+# The macOS x86_64 pins in requirements.txt (torch==2.2.2 and the versions it
+# drags along) do NOT apply here — that ceiling exists only because PyTorch
+# stopped shipping macOS Intel wheels after 2.2.2. On Linux+CUDA use current
+# versions; torch 2.6.0+cu124 is known good.
 
-torch>=2.4                    # any CUDA build; install from the cu12x index
+torch>=2.4                    # any CUDA build; install from the cu12x index first
 transformers>=4.44,<5         # 5.x needs torch>=2.5; 4.x keeps parity with the CPU run
-sentence-transformers>=3.0,<4
+sentence-transformers>=3.0,<4 # v5 changed the CrossEncoder API this code uses
 tokenizers<0.21
 huggingface-hub<1.0
 
-# --- pinned for a real incompatibility, not caution ---
+# --- a real incompatibility, not caution -----------------------------------
 # doubleml 0.10.1 calls sklearn.utils.validation.check_X_y(force_all_finite=...),
-# which was deprecated in scikit-learn 1.6 and REMOVED in 1.9. Anything >=1.9
-# fails at DoubleMLPLR.fit() with a TypeError.
-scikit-learn==1.7.2
+# deprecated in scikit-learn 1.6 and REMOVED by 1.9. With sklearn >=1.9,
+# DoubleMLPLR.fit() dies with a TypeError and Module 4 cannot run.
+# Verified working: 1.6.1 and 1.7.2.
+scikit-learn>=1.4,<1.8
 doubleml==0.10.1
 
 lightgbm>=4.3
 statsmodels>=0.14
-numpy<2
+numpy>=1.26,<3                # validated on 1.26; numpy 2 is fine on Linux
 scipy>=1.11
 pandas>=2.2
 pyarrow>=15
 matplotlib>=3.8
 ir_datasets>=0.5.5
 bm25s>=0.2
-PyStemmer>=2.2
+PyStemmer>=2.2                # NB: the PyPI name is PyStemmer; `pip install Stemmer`
+                              # installs an unrelated stub that does not provide
+                              # the `Stemmer` module this code imports.
 
 # CPU-only extra: the ONNX cross-encoder path is skipped on CUDA, so this is
 # optional on a GPU box. Harmless to install.

@@ -13,7 +13,25 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import sys
 from pathlib import Path
+
+if sys.version_info < (3, 10):
+    raise RuntimeError(
+        f"RAGDAG needs Python >= 3.10 (3.11 recommended); this is "
+        f"{sys.version_info.major}.{sys.version_info.minor} at {sys.executable}.\n"
+        "\n"
+        "On an HPC login node the usual cause is that a `module load` for Python\n"
+        "silently failed, so `python -m venv` fell back to the system interpreter.\n"
+        "Check with:  python -V   and   module spider python\n"
+        "\n"
+        "The most reliable fix needs no module system at all - uv fetches a\n"
+        "standalone CPython:\n"
+        "    curl -LsSf https://astral.sh/uv/install.sh | sh\n"
+        "    export PATH=\"$HOME/.local/bin:$PATH\"\n"
+        "    rm -rf .venv && uv venv --python 3.11 .venv\n"
+        "    source .venv/bin/activate\n"
+    )
 
 import numpy as np
 
