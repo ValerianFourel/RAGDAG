@@ -95,6 +95,9 @@ def current_meta() -> dict:
         "dense_model": config.DENSE_MODEL,
         "ce_model": config.CROSS_ENCODER_MODEL,
         "seed": config.SEED,
+        # Source fingerprint: a code change must invalidate cached artefacts,
+        # otherwise a corrected sampler silently reports the old parquet.
+        "code": config.code_fingerprint(),
     }
 
 

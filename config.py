@@ -54,6 +54,35 @@ N_QUERIES: int | None = int(_n_env) if _n_env else None
 # --------------------------------------------------------------------------- #
 # Device
 # --------------------------------------------------------------------------- #
+#: Modules whose source affects the numbers. Hashed into the run fingerprint so
+#: that a code change invalidates cached artefacts.
+_CODE_MODULES = (
+    "config.py", "pipeline.py", "interventions.py",
+    "mediation.py", "dml_analysis.py", "stability.py",
+)
+
+
+def code_fingerprint() -> str:
+    """Content hash of the modules that determine the results.
+
+    Without this, ``run_meta.json`` records only configuration, so a pure code
+    change leaves the fingerprint identical and ``run_all`` silently reuses
+    artefacts computed by the *old* code. That is not hypothetical: the
+    control-term sampler was corrected twice while the config stayed fixed, and
+    a rerun would have reported the pre-fix parquet as a fresh result.
+
+    Hashes source content rather than the git SHA on purpose - it catches
+    uncommitted edits, and it works in a clone without git available.
+    """
+    h = hashlib.blake2b(digest_size=8)
+    root = Path(__file__).parent
+    for name in _CODE_MODULES:
+        p = root / name
+        h.update(name.encode())
+        h.update(p.read_bytes() if p.exists() else b"<missing>")
+    return h.hexdigest()
+
+
 def stable_seed(*parts: object) -> int:
     """Process-independent 32-bit seed derived from ``parts``.
 
