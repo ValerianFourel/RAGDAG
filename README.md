@@ -57,6 +57,51 @@ needed. Check what it resolved before committing to a long run:
 python -c "import config; print(config.device_banner()); print(config.summary())"
 ```
 
+### HoreKa (KIT)
+
+HoreKa's `accelerated` partition gives 4× A100-40 per node. The one thing that
+will bite you: **compute nodes have no outbound internet**, so models and data
+must be fetched on a login node first and the job must run offline.
+
+```bash
+# ── login node ────────────────────────────────────────────────────────────
+ws_allocate ragdag 30                       # workspace; $HOME is quota'd
+export RAGDAG_WS=$(ws_find ragdag)
+cd "$RAGDAG_WS" && git clone https://github.com/ValerianFourel/RAGDAG.git && cd RAGDAG
+
+module avail python 2>&1 | head            # find the Python 3.11+ module
+module load devel/python/3.11              # adjust to what's actually there
+python -m venv .venv && source .venv/bin/activate
+pip install -U pip
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements-gpu.txt
+
+export HF_HOME="$RAGDAG_WS/hf" IR_DATASETS_HOME="$RAGDAG_WS/ir_datasets"
+python scripts/prefetch.py                 # ~1 min; downloads models + NFCorpus
+
+# ── submit ────────────────────────────────────────────────────────────────
+sbatch --export=ALL,RAGDAG_WS="$RAGDAG_WS",N_QUERIES=30 \
+       --partition=dev_accelerated --time=00:30:00 scripts/horeka.sbatch   # smoke
+sbatch --export=ALL,RAGDAG_WS="$RAGDAG_WS" scripts/horeka.sbatch           # full
+```
+
+Then `squeue --me`, and read the verdict from the end of the job log or
+`results/REPORT.md`.
+
+`scripts/prefetch.py` populates `$HF_HOME`, `$IR_DATASETS_HOME`, `cache/corpus.pkl`
+and `cache/bm25_index/` — about 110 MB. It deliberately skips the document
+embeddings: those are keyed on the dense sequence length, which differs between
+the CPU and GPU profiles, and they take seconds on an A100 against minutes on a
+shared login node. The job builds them.
+
+`scripts/horeka.sbatch` sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` so an
+air-gapped node fails loudly instead of hanging on a socket. Verified: every
+resource loads from cache with both flags set.
+
+Check `--gres=gpu:4` and the module name against your allocation before the full
+run — `scontrol show partition accelerated` and `module avail` are authoritative,
+not this README.
+
 ### Multi-GPU (4-GPU node)
 
 ```bash
