@@ -5,6 +5,11 @@
 #   sbatch --export=ALL,DATASET=beir/scifact/test scripts/horeka.sbatch
 #   sbatch --export=ALL,N_QUERIES=30 scripts/horeka.sbatch    # smoke test
 #
+#   # several collections in ONE job - avoids the 1-job-per-user QOS limit on
+#   # dev_accelerated, and reuses the warm GPU/model state between datasets:
+#   sbatch --export=ALL,DATASETS="beir/nfcorpus/test beir/scifact/test" \
+#          --partition=accelerated --time=04:00:00 scripts/horeka.sbatch
+#
 # Results are written to results/<dataset-tag>/ so datasets never overwrite
 # each other. DATASET must also have been prefetched on the login node.
 #
@@ -57,7 +62,26 @@ echo "------------------------------------------------------------------"
 # One worker per GPU, then the merge pass. The launcher reads
 # CUDA_VISIBLE_DEVICES (which SLURM sets) rather than trusting nvidia-smi.
 export PYTHON=python
-srun --ntasks=1 --export=ALL bash scripts/run_multigpu.sh
+
+# DATASETS (plural, space-separated) runs several collections sequentially in
+# one allocation. A failure on one is reported and does NOT abort the rest -
+# losing four completed datasets because the fifth had no prefetched corpus
+# would be the wrong trade.
+FAILED=""
+for ds in ${DATASETS:-${DATASET:-__default__}}; do
+  if [ "$ds" != "__default__" ]; then export DATASET="$ds"; fi
+  echo
+  echo "##################################################################"
+  echo "# dataset: ${DATASET:-<config default>}   $(date +%H:%M:%S)"
+  echo "##################################################################"
+  if srun --ntasks=1 --export=ALL bash scripts/run_multigpu.sh; then
+    python -c "import config; print('   OK ->', config.RESULTS_DIR)"
+  else
+    echo "!! FAILED: ${DATASET:-<default>}" >&2
+    FAILED="$FAILED ${DATASET:-<default>}"
+  fi
+done
+[ -n "$FAILED" ] && echo "!! datasets that failed:$FAILED" >&2
 
 echo "------------------------------------------------------------------"
 echo "finished     $(date)"
