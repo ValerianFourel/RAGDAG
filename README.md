@@ -197,6 +197,34 @@ python -m stability
 python -m report
 ```
 
+### Publishing results to HuggingFace
+
+Results are archived to a HF **dataset** repo. Run this on a **login node** —
+compute nodes have no outbound route, so an upload from a worker hangs until the
+walltime expires.
+
+```bash
+huggingface-cli login                 # or export HF_TOKEN=...
+python scripts/publish.py --repo <user>/ragdag-results --dry-run
+python scripts/publish.py --repo <user>/ragdag-results
+```
+
+Repos are created **private** by default; `--public` is a deliberate opt-in.
+Only `results/` is uploaded — `cache/` holds a 91 MB ONNX graph and the document
+embeddings, all regenerable and none of which belong in a results record.
+
+Each dataset directory gets a `MANIFEST.json` pinning the git SHA, the source
+fingerprint, the run config and per-file checksums. **Artefacts with different
+`code_fingerprint` values are not comparable** — the term sampler was corrected
+twice during development, and mixing pre- and post-fix runs would silently blend
+two different experiments.
+
+Fetch them back with:
+
+```bash
+python scripts/publish.py --repo <user>/ragdag-results --download
+```
+
 ### Environment overrides
 
 | variable | effect |
@@ -206,7 +234,9 @@ python -m report
 | `MAX_TARGET_DOCS` | Target documents per query. Default 10 (GPU) / 3 (CPU). |
 | `CE_MAX_LENGTH` | Cross-encoder sequence length. Default 512 (GPU) / 192 (CPU). |
 | `CE_BATCH_SIZE` | Default 256 (GPU) / 64 (CPU). |
-| `N_QUERIES` | Query subset for smoke tests. Default: all 323. |
+| `N_QUERIES` | Query subset for smoke tests. Default: all. |
+| `DATASET` | ir_datasets id. Default `beir/nfcorpus/test`. Caches and results are scoped by it. |
+| `HF_REPO` | Default target for `scripts/publish.py`. |
 | `USE_FP16` | Half precision. **Off by default even on A100** — see below. |
 | `ALLOW_TF32` | TF32 matmuls on Ampere. Off by default — see below. |
 

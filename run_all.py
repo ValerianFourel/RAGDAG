@@ -334,6 +334,11 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
     print("\n[merge] per-stage timings:")
     for k, v in clock.times.items():
         print(f"    {k:24s} {_fmt(v)}")
+    print(f"\n[merge] results -> {config.RESULTS_DIR}")
+    print(
+        "[merge] to archive: run `python scripts/publish.py --repo <user>/<name>` "
+        "on a LOGIN node (compute nodes have no outbound route)."
+    )
 
 
 # --------------------------------------------------------------------------- #
