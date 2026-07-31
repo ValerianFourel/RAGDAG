@@ -62,13 +62,17 @@ echo "=== launching $N_GPUS worker(s) on GPU(s) [${DEVS[*]}], $N_TORCH_THREADS t
 # in ONE process first. Without this, N workers race to build and write the
 # same cache files on first run and can corrupt each other's output.
 CUDA_VISIBLE_DEVICES="${DEVS[0]}" $PY -u -c "
-import config, pipeline
+import config, pipeline, interventions
 config.set_seeds()
 print('[warmup]', config.device_banner())
 corpus, queries = pipeline.load_corpus_and_queries()
 p = pipeline.RetrievalPipeline(corpus)
 p.bm25; p.doc_emb
-print('[warmup] corpus, BM25 index and document embeddings are cached')
+# Term-sampler frequency tables: a full re-tokenisation of the collection,
+# read-only and identical for every worker. Built here so the 4 shards load it
+# instead of each spending minutes of allocated GPU time rebuilding it.
+interventions.build_vocab_stats(corpus)
+print('[warmup] corpus, BM25 index, embeddings and vocabulary tables are cached')
 " 2>&1 | tee "logs/${DS_TAG}_warmup.log"
 
 pids=()

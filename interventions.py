@@ -21,6 +21,7 @@ Run standalone::
 from __future__ import annotations
 
 import math
+import pickle
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -50,33 +51,139 @@ FIG_EFFECTS = config.RESULTS_DIR / "fig_intervention_effects.png"
 # --------------------------------------------------------------------------- #
 @dataclass
 class VocabStats:
-    """Corpus-level lexical statistics used to choose injection terms."""
+    """Corpus-level lexical statistics used to choose injection terms.
+
+    Carries the two quantities the do()-operator is parameterised on:
+
+    * **support** - ``df(t)/N``, the fraction of documents containing ``t``.
+      Controls *how many documents the injection moves*, because appending
+      ``t`` to a query changes the BM25 score of exactly the ``df(t)``
+      documents that contain it and of no others.
+    * **lift** - ``P(t|d) / P(t|corpus)``, a density ratio. Controls *how much
+      this particular document moves*.
+
+    These are orthogonal and they drive different stages: support drives
+    candidate-pool churn (a first-stage effect), lift drives the target's own
+    rescoring (a reranker effect). The previous TF-IDF sampler collapsed both
+    into one weight and could not separate them - and because ``tf`` dominated
+    that product, it drew *topical* words rather than *distinctive* ones.
+    """
 
     df: dict[str, int]
+    cf: dict[str, int]
     n_docs: int
+    total_tokens: int
     control_pool: list[str]
+    bin_edges: np.ndarray
+    control_pool_by_bin: list[list[str]]
 
     def idf(self, term: str) -> float:
         return math.log(self.n_docs / (1 + self.df.get(term, 0)))
+
+    def support(self, term: str) -> float:
+        """Fraction of documents containing ``term``."""
+        return self.df.get(term, 0) / max(1, self.n_docs)
+
+    def lift(self, term: str, tf_in_doc: int, doc_len: int) -> float:
+        """Density of ``term`` in one document relative to the whole corpus."""
+        if tf_in_doc <= 0 or doc_len <= 0:
+            return 0.0
+        p_corpus = self.cf.get(term, 0) / max(1, self.total_tokens)
+        if p_corpus <= 0:
+            return float("inf")
+        return (tf_in_doc / doc_len) / p_corpus
+
+    def bin_of(self, term: str) -> int:
+        """Support-bin index, or -1 if the term is outside the admissible band."""
+        s = self.support(term)
+        if s < self.bin_edges[0] or s > self.bin_edges[-1]:
+            return -1
+        return int(min(np.searchsorted(self.bin_edges, s, side="right") - 1,
+                       len(self.bin_edges) - 2))
+
+    @property
+    def n_bins(self) -> int:
+        return len(self.bin_edges) - 1
 
 
 def _is_word(t: str) -> bool:
     return t.isalpha() and len(t) >= 3
 
 
-def build_vocab_stats(corpus: Corpus, min_df: int = 5) -> VocabStats:
-    """Document frequencies plus the pool of admissible control terms.
+def _frequency_tables(corpus: Corpus) -> tuple[dict[str, int], dict[str, int], int, int]:
+    """``(df, cf, n_docs, total_tokens)``, cached to disk.
 
-    Control terms are restricted to reasonably common alphabetic words so that
-    the control arm is not secretly an "inject a junk token" arm - that would
-    make the contrast trivially significant for the wrong reason.
+    Collection frequency needs per-document term *counts*; the corpus cache
+    stores presence sets only, so this is a full re-tokenisation of the
+    collection - minutes on the larger BEIR corpora. It is read-only and
+    identical for every shard worker, so it is computed once and reused.
+    Serialised as plain dicts rather than as a dataclass: a pickled dataclass
+    binds to its defining module and has already been unloadable here once.
     """
+    p = config.VOCAB_STATS_CACHE
+    if p.exists():
+        try:
+            with open(p, "rb") as f:
+                d = pickle.load(f)
+            if d.get("n_docs") == len(corpus):
+                return d["df"], d["cf"], d["n_docs"], d["total_tokens"]
+            print(f"[interventions] {p.name} is for a different corpus size - rebuilding")
+        except Exception as e:  # noqa: BLE001 - a bad cache must not be fatal
+            print(f"[interventions] could not read {p.name} ({e}) - rebuilding")
+
+    t0 = time.time()
     df: Counter[str] = Counter()
-    for toks in corpus.doc_content_tokens:
-        df.update(t for t in toks if _is_word(t))
-    n = len(corpus)
-    pool = sorted(t for t, c in df.items() if min_df <= c <= 0.20 * n)
-    return VocabStats(df=dict(df), n_docs=n, control_pool=pool)
+    cf: Counter[str] = Counter()
+    for i in range(len(corpus)):
+        toks = [t for t in content_tokens(corpus.texts[i]) if _is_word(t)]
+        cf.update(toks)
+        df.update(set(toks))
+    n, total = len(corpus), int(sum(cf.values()))
+    print(f"[interventions] built vocabulary tables in {time.time() - t0:.1f}s "
+          f"({n} docs, {total} tokens, {len(df)} terms) -> {p.name}")
+    tmp = p.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump({"df": dict(df), "cf": dict(cf), "n_docs": n, "total_tokens": total}, f)
+    tmp.replace(p)  # atomic: 4 workers may race on first run
+    return dict(df), dict(cf), n, total
+
+
+def build_vocab_stats(corpus: Corpus, min_df: int = 5) -> VocabStats:
+    """Document/collection frequencies, support bins, and per-bin control pools.
+
+    Bins are **log-spaced** over support: vocabulary is Zipfian, so linear bins
+    would put essentially the whole vocabulary in the lowest bucket and give no
+    coverage of the range where pool churn actually happens.
+
+    A control pool is built *per bin* so the control arm can be matched to the
+    treatment arm on support. Without that match the two arms differ on two
+    dimensions at once - in-document vs not, and common vs rare - and the
+    contrast is not identified on either.
+    """
+    df, cf, n, total = _frequency_tables(corpus)
+
+    lo = max(min_df / n, config.SUPPORT_MIN)
+    hi = config.SUPPORT_MAX
+    edges = np.logspace(np.log10(lo), np.log10(hi), config.N_SUPPORT_BINS + 1)
+    # logspace does not round-trip its own endpoints (10**log10(x) != x in
+    # binary floating point), which silently dropped every term sitting exactly
+    # at min_df - the rarest bin's whole boundary. Pin the ends.
+    edges[0], edges[-1] = lo, hi
+
+    vs = VocabStats(
+        df=dict(df), cf=dict(cf), n_docs=n, total_tokens=total,
+        control_pool=[], bin_edges=edges, control_pool_by_bin=[],
+    )
+    by_bin: list[list[str]] = [[] for _ in range(vs.n_bins)]
+    for t, c in df.items():
+        if c < min_df:
+            continue
+        b = vs.bin_of(t)
+        if b >= 0:
+            by_bin[b].append(t)
+    vs.control_pool_by_bin = [sorted(v) for v in by_bin]
+    vs.control_pool = sorted(t for v in by_bin for t in v)
+    return vs
 
 
 def tfidf_terms(corpus: Corpus, doc_id: str, vs: VocabStats) -> tuple[list[str], np.ndarray]:
@@ -102,32 +209,82 @@ def sample_treatment_terms(
     rng: np.random.Generator,
     n: int = config.N_TREATMENT_TERMS,
     query_bm25: frozenset[str] = frozenset(),
-) -> list[str]:
-    """Sample ``n`` terms from the target document, TF-IDF weighted.
+) -> list[dict]:
+    """Sample ``n`` terms from the target document, stratified by **support**.
 
-    Terms already present in the query are excluded, otherwise the
-    intervention would be a no-op on the lexical channel.
+    Two-stage draw:
+
+    1. pick a support bin uniformly at random among the bins this document can
+       actually populate (without replacement while distinct bins remain);
+    2. within that bin pick a term with probability proportional to its
+       **lift** in this document.
+
+    Stage 1 is the fix for the old sampler. Under TF-IDF weighting the realised
+    treatment terms landed ~3x more common than the controls they were
+    contrasted against (median support 1.3% vs 0.4%), and support turns out to
+    be the strongest single moderator in the data - the reranker's share of the
+    decomposition moves from 73% to 91% across support quartiles *within one
+    collection*. Sweeping support deliberately turns that confound into a
+    designed factor and yields a dose-response curve instead of a point
+    estimate.
+
+    Stage 2 preserves the original intent - inject a word characteristic of
+    *this* document - but now expressed as a density ratio rather than as a
+    tf-idf product in which ``tf`` silently dominated.
+
+    Terms already present in the query are excluded (against the BM25 view of
+    the query, not just its surface tokens), otherwise the intervention would
+    be close to a no-op on the lexical channel.
+
+    Returns one provenance dict per sampled term, so the recorded
+    ``select_prob`` is the sampler's own number rather than a reconstruction
+    that can drift away from it.
     """
-    terms, w = tfidf_terms(corpus, doc_id, vs)
-    # Exclude against the BM25 view of the query, not just its surface tokens:
-    # injecting a term the query already contributes is close to a no-op on the
-    # lexical channel, diluting the treatment arm the mirror-image way the
-    # stopword/stem mismatch inflated the control arm.
-    keep = [
-        j
-        for j, t in enumerate(terms)
-        if t not in query_tokens and not (bm25_terms(t) & query_bm25)
+    i = corpus.idx(doc_id)
+    dl = int(corpus.doc_len[i])
+    tf_all = Counter(t for t in content_tokens(corpus.texts[i]) if _is_word(t))
+    cands = [
+        t for t in sorted(tf_all)
+        if t not in query_tokens
+        and not (bm25_terms(t) & query_bm25)
+        and vs.bin_of(t) >= 0
     ]
-    if not keep:
+    if not cands:
         return []
-    terms = [terms[j] for j in keep]
-    w = w[keep]
-    if w.sum() <= 0:
-        w = np.ones(len(terms))
-    p = w / w.sum()
-    n = min(n, len(terms))
-    idx = rng.choice(len(terms), size=n, replace=False, p=p)
-    return [terms[j] for j in idx]
+
+    by_bin: dict[int, list[str]] = {}
+    for t in cands:
+        by_bin.setdefault(vs.bin_of(t), []).append(t)
+
+    out: list[dict] = []
+    available = sorted(by_bin)
+    for _ in range(min(n, len(cands))):
+        if not available:
+            available = sorted(by_bin)
+            if not available:
+                break
+        b = int(available[rng.integers(len(available))])
+        available.remove(b)
+        pool = by_bin[b]
+        w = np.array([max(vs.lift(t, tf_all[t], dl), 1e-12) for t in pool], dtype=np.float64)
+        p = w / w.sum()
+        j = int(rng.choice(len(pool), p=p))
+        term = pool[j]
+        # P(bin) * P(term | bin); n_bins_available is the count at draw time.
+        out.append({
+            "term": term,
+            "support_bin": b,
+            "select_prob": float((1.0 / max(1, len(by_bin))) * p[j]),
+            "term_lift": float(vs.lift(term, tf_all[term], dl)),
+            "n_candidate_terms": len(cands),
+            "n_candidate_bins": len(by_bin),
+        })
+        pool.remove(term)
+        if not pool:
+            by_bin.pop(b, None)
+        if not by_bin:
+            break
+    return out
 
 
 _STEMMER = None
@@ -178,11 +335,25 @@ def sample_control_terms(
     query_tokens: set[str],
     vs: VocabStats,
     rng: np.random.Generator,
+    match_bins: list[int] | None = None,
     n: int = config.N_CONTROL_TERMS,
     doc_bm25: frozenset[str] = frozenset(),
     query_bm25: frozenset[str] = frozenset(),
-) -> list[str]:
-    """Sample ``n`` corpus terms that cannot touch the document's BM25 score.
+) -> list[dict]:
+    """Sample corpus terms that cannot touch the document's BM25 score,
+    **matched to the treatment arm on support bin**.
+
+    One control is drawn per entry of ``match_bins``, from that same bin. This
+    is the identification fix: with an unmatched control pool the two arms
+    differ simultaneously in whether the term is in the document *and* in how
+    common the term is, and support is known to move the outcome strongly. A
+    bin-matched control isolates the first difference.
+
+    High-support bins are hard to match - a word in 30% of documents is likely
+    to be in this document too, and would then fail the BM25-absence test. When
+    a bin cannot be filled the search widens to the nearest bins and
+    ``control_bin_matched`` records that it did, so the analysis can drop or
+    reweight those rows rather than silently treating them as matched.
 
     Absence is decided with **the BM25 tokeniser itself** - same stopword list,
     same stemmer, same regex as the index - rather than with an approximation.
@@ -198,18 +369,52 @@ def sample_control_terms(
     target document's BM25 score, which is the invariant the whole
     treatment-versus-control contrast rests on.
     """
-    out: list[str] = []
+    if match_bins is None:
+        match_bins = [int(rng.integers(vs.n_bins)) for _ in range(n)]
     forbidden = doc_bm25 | query_bm25
-    pool = vs.control_pool
-    for _ in range(50 * n):
-        if len(out) == n:
-            break
-        t = pool[int(rng.integers(len(pool)))]
-        if t in doc_tokens or t in query_tokens or t in out:
+    taken: set[str] = set()
+    out: list[dict] = []
+
+    def _try(bin_idx: int) -> str | None:
+        pool = vs.control_pool_by_bin[bin_idx]
+        if not pool:
+            return None
+        for _ in range(200):
+            t = pool[int(rng.integers(len(pool)))]
+            if t in taken or t in doc_tokens or t in query_tokens:
+                continue
+            if bm25_terms(t) & forbidden:
+                continue
+            return t
+        return None
+
+    for want in match_bins:
+        term, got, matched = None, want, True
+        # widen outward: want, want-1, want+1, want-2, want+2, ...
+        for step in range(vs.n_bins):
+            for cand_bin in ({want} if step == 0 else {want - step, want + step}):
+                if not 0 <= cand_bin < vs.n_bins:
+                    continue
+                term = _try(int(cand_bin))
+                if term is not None:
+                    got, matched = int(cand_bin), (cand_bin == want)
+                    break
+            if term is not None:
+                break
+        if term is None:
             continue
-        if bm25_terms(t) & forbidden:
-            continue
-        out.append(t)
+        taken.add(term)
+        pool_n = len(vs.control_pool_by_bin[got])
+        out.append({
+            "term": term,
+            "support_bin": got,
+            "support_bin_requested": int(want),
+            "control_bin_matched": bool(matched),
+            "select_prob": float(1.0 / max(1, pool_n)),
+            "term_lift": 0.0,  # absent from the document by construction
+            "n_candidate_terms": pool_n,
+            "n_candidate_bins": vs.n_bins,
+        })
     return out
 
 
@@ -225,60 +430,59 @@ OPERATOR = "append_term"
 def term_provenance(
     corpus: Corpus,
     doc_id: str,
-    term: str,
+    draw: dict,
     vs: VocabStats,
     arm: str,
-    query_tokens: set[str],
-    query_bm25: frozenset[str],
 ) -> dict:
     """Everything about *why this word* was injected into *this query*.
 
-    Computed after the fact from the same inputs the sampler saw, so it adds no
-    RNG draws and cannot perturb which terms were chosen. Recording only
-    ``(doc_id, term)`` would make the published log unauditable: a reader could
-    not tell whether a term was the document's most distinctive word or its
-    least, nor how likely it was to be drawn at all.
+    ``draw`` is the record the sampler returned, so ``select_prob`` and
+    ``support_bin`` are the sampler's own values rather than a reconstruction.
+    The previous version recomputed them from the same inputs, which was
+    correct only for as long as the two code paths stayed in step; returning
+    them directly removes that failure mode entirely.
+
+    Recording only ``(doc_id, term)`` would make the published log unauditable:
+    a reader could not tell whether a term was the document's most distinctive
+    word or its least, how common it is in the corpus, nor how likely it was to
+    be drawn at all.
     """
+    term = draw["term"]
     i = corpus.idx(doc_id)
     tf_all = Counter(t for t in content_tokens(corpus.texts[i]) if _is_word(t))
     df = vs.df.get(term, 0)
-    rec = {
+    b = int(draw.get("support_bin", -1))
+    lo, hi = (float(vs.bin_edges[b]), float(vs.bin_edges[b + 1])) if b >= 0 else (float("nan"),) * 2
+    return {
         "operator": OPERATOR,
+        "sampler": "support_lift_stratified",
         "term_source": "target_document" if arm == "treatment" else "corpus_vocabulary",
         "term_tf_in_doc": int(tf_all.get(term, 0)),
         "term_df_corpus": int(df),
-        "term_doc_freq_pct": float(df / max(1, vs.n_docs)),
+        "term_cf_corpus": int(vs.cf.get(term, 0)),
+        # Kept under the historical name (it holds a *fraction*, not a percent)
+        # so old analyses keep working; term_support is the correctly-named one.
+        "term_doc_freq_pct": float(vs.support(term)),
+        "term_support": float(vs.support(term)),
+        "term_lift": float(draw.get("term_lift", float("nan"))),
+        "support_bin": b,
+        "support_bin_lo": lo,
+        "support_bin_hi": hi,
+        "support_bin_requested": int(draw.get("support_bin_requested", b)),
+        "control_bin_matched": bool(draw.get("control_bin_matched", True)),
         "term_idf": float(vs.idf(term)),
+        "term_tfidf_weight": float(tf_all.get(term, 0) * vs.idf(term)),
         "term_in_title": bool(term in set(content_tokens(corpus.titles[i]))),
         "term_bm25_form": " ".join(sorted(bm25_terms(term))) or "<stopword/dropped>",
         "injection_position": "append",
-        "select_prob": float("nan"),
-        "n_candidate_terms": 0,
+        "select_prob": float(draw.get("select_prob", float("nan"))),
+        "n_candidate_terms": int(draw.get("n_candidate_terms", 0)),
+        "n_candidate_bins": int(draw.get("n_candidate_bins", vs.n_bins)),
+        # Exactly the number of documents whose BM25 score this injection
+        # changes: appending t moves every document containing t and no other.
+        # The ex-ante interference footprint of the operator.
+        "pred_docs_moved": int(df),
     }
-    if arm == "treatment":
-        # Reconstruct the sampler's candidate pool and the exact probability
-        # this term carried. Same filter as sample_treatment_terms.
-        terms, w = tfidf_terms(corpus, doc_id, vs)
-        keep = [
-            j for j, t in enumerate(terms)
-            if t not in query_tokens and not (bm25_terms(t) & query_bm25)
-        ]
-        if keep:
-            kt = [terms[j] for j in keep]
-            kw = w[keep]
-            if kw.sum() <= 0:
-                kw = np.ones(len(kt))
-            p = kw / kw.sum()
-            rec["n_candidate_terms"] = len(kt)
-            rec["term_tfidf_weight"] = float(kw[kt.index(term)]) if term in kt else float("nan")
-            rec["select_prob"] = float(p[kt.index(term)]) if term in kt else float("nan")
-        else:
-            rec["term_tfidf_weight"] = float("nan")
-    else:
-        rec["n_candidate_terms"] = len(vs.control_pool)
-        rec["term_tfidf_weight"] = float("nan")
-        rec["select_prob"] = 1.0 / max(1, len(vs.control_pool))
-    return rec
 
 
 def origin_documents(corpus: Corpus, doc_ids: list[str], snippet_chars: int = 400) -> pd.DataFrame:
@@ -370,24 +574,29 @@ def run_interventions(
 
             dtok = corpus.doc_content_tokens[corpus.idx(doc_id)]
             dbm25 = bm25_terms(corpus.texts[corpus.idx(doc_id)])
+            # Treatment first: its support bins define what the control arm
+            # must be matched to, so the two arms differ only in whether the
+            # term came from the document.
+            treat = sample_treatment_terms(
+                corpus, doc_id, qtok, vs, rng, query_bm25=qbm25
+            )
             arms = {
-                "treatment": sample_treatment_terms(
-                    corpus, doc_id, qtok, vs, rng, query_bm25=qbm25
-                ),
+                "treatment": treat,
                 "control": sample_control_terms(
-                    dtok, qtok, vs, rng, doc_bm25=dbm25, query_bm25=qbm25
+                    dtok, qtok, vs, rng,
+                    match_bins=[d["support_bin"] for d in treat],
+                    doc_bm25=dbm25, query_bm25=qbm25,
                 ),
             }
-            for arm, terms in arms.items():
-                for term in terms:
+            for arm, draws in arms.items():
+                for draw in draws:
+                    term = draw["term"]
                     q1 = f"{q0} {term}"
                     res = pipe.run(q1)
                     new_rank = res.rank_of(doc_id)
                     di = corpus.idx(doc_id)
                     new_ce = res.ce_score_of(doc_id)
-                    prov_term = term_provenance(
-                        corpus, doc_id, term, vs, arm, qtok, qbm25
-                    )
+                    prov_term = term_provenance(corpus, doc_id, draw, vs, arm)
                     rows.append(
                         {
                             "query_id": qid,

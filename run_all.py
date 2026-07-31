@@ -90,6 +90,13 @@ def current_meta() -> dict:
         "max_target_docs": config.MAX_TARGET_DOCS_PER_QUERY,
         "n_treatment_terms": config.N_TREATMENT_TERMS,
         "n_control_terms": config.N_CONTROL_TERMS,
+        # do()-operator term sampling. A change to the support band or bin
+        # count changes which words are injected, so artefacts computed under
+        # one setting must not be reused under another.
+        "term_sampler": "support_lift_stratified",
+        "n_support_bins": config.N_SUPPORT_BINS,
+        "support_min": config.SUPPORT_MIN,
+        "support_max": config.SUPPORT_MAX,
         "ce_max_length": config.CE_MAX_LENGTH,
         "dense_max_length": config.MAX_SEQ_LENGTH,
         "precision": config.PRECISION_TAG,

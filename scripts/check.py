@@ -204,10 +204,13 @@ def _ctrl():
             di = _corpus.idx(d)
             dtok = _corpus.doc_content_tokens[di]
             dbm = I.bm25_terms(_corpus.texts[di])
-            I.sample_treatment_terms(_corpus, d, qtok, vs, rng, query_bm25=qbm)
-            for t in I.sample_control_terms(
-                dtok, qtok, vs, rng, doc_bm25=dbm, query_bm25=qbm
+            treat = I.sample_treatment_terms(_corpus, d, qtok, vs, rng, query_bm25=qbm)
+            for draw in I.sample_control_terms(
+                dtok, qtok, vs, rng,
+                match_bins=[x["support_bin"] for x in treat],
+                doc_bm25=dbm, query_bm25=qbm,
             ):
+                t = draw["term"]
                 n += 1
                 if I.bm25_terms(t) & (dbm | qbm):
                     bad.append(t)
@@ -256,7 +259,7 @@ def _resid():
         if not tgts:
             continue
         d = tgts[0]
-        terms = I.sample_treatment_terms(_corpus, d, qtok, vs, rng)[:1]
+        terms = [x["term"] for x in I.sample_treatment_terms(_corpus, d, qtok, vs, rng)[:1]]
         r0 = _pipe.run(q0, first_stage="bm25").rank_of(d)
         for t in terms:
             out = M.decompose(_pipe, q0, f"{q0} {t}", d, "bm25", r0)

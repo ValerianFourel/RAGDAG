@@ -199,6 +199,36 @@ N_TREATMENT_TERMS: int = 3
 N_CONTROL_TERMS: int = 3
 N_BOOTSTRAP: int = 1000
 
+# --- do()-operator term sampling: support x lift ---------------------------
+#
+# The injected term is parameterised on two orthogonal quantities:
+#
+#   support = df(t)/N              how many documents the injection moves
+#   lift    = P(t|d) / P(t|corpus) how much *this* document moves
+#
+# They drive different stages. Appending t changes the BM25 score of exactly
+# the df(t) documents containing t, so support is the operator's interference
+# footprint and it governs candidate-pool churn - a first-stage effect. Lift
+# governs the target's own rescoring - a reranker effect.
+#
+# The previous sampler weighted by tf*idf, in which tf dominated (rank corr
+# 0.72 with tf vs 0.44 with idf). It therefore drew *topical* words rather than
+# *distinctive* ones, and the realised treatment terms came out ~3x more common
+# than the controls they were contrasted against. Since the reranker's share of
+# the decomposition moves from 73% to 91% across support quartiles *within one
+# collection*, that mismatch confounded every arm comparison.
+#
+# Sampling is stratified over log-spaced support bins - Zipf puts almost the
+# whole vocabulary in the bottom linear bin - with the control arm matched
+# bin-for-bin.
+N_SUPPORT_BINS: int = int(os.environ.get("N_SUPPORT_BINS", 6))
+
+#: Support band for admissible injection terms. The lower edge is raised to
+#: ``min_df/N`` when that is larger. The upper edge excludes near-stopwords,
+#: which carry almost no BM25 weight and cannot be matched in the control arm.
+SUPPORT_MIN: float = float(os.environ.get("SUPPORT_MIN", 0.0005))
+SUPPORT_MAX: float = float(os.environ.get("SUPPORT_MAX", 0.50))
+
 # --------------------------------------------------------------------------- #
 # Module 4 - DoubleML
 # --------------------------------------------------------------------------- #
@@ -273,6 +303,16 @@ EMBEDDINGS_CACHE: Path = (
 )
 BM25_INDEX_CACHE: Path = CACHE_DIR / f"bm25_{DATASET_TAG}"
 CORPUS_CACHE: Path = CACHE_DIR / f"corpus_{DATASET_TAG}_v{CORPUS_FORMAT}.pkl"
+
+#: Corpus-wide document and collection frequencies for the term sampler.
+#:
+#: Cached because computing collection frequency needs per-document term
+#: *counts*, which the corpus cache does not store (it keeps presence sets), so
+#: it costs a full re-tokenisation of the collection - ~8 minutes on TREC-COVID.
+#: Without this every one of the 4 shard workers pays that independently, on
+#: allocated GPU time, to derive an identical read-only table. Profile-independent:
+#: it depends only on the corpus, not on K, sequence lengths or precision.
+VOCAB_STATS_CACHE: Path = CACHE_DIR / f"vocab_{DATASET_TAG}_v1.pkl"
 
 
 def baseline_cache_path(qids: list[str]) -> Path:
@@ -416,6 +456,8 @@ def summary() -> dict[str, object]:
         "max_target_docs_per_query": MAX_TARGET_DOCS_PER_QUERY,
         "n_treatment_terms": N_TREATMENT_TERMS,
         "n_control_terms": N_CONTROL_TERMS,
+        "term_sampler": f"support x lift, {N_SUPPORT_BINS} log bins "
+                        f"[{SUPPORT_MIN:.2%}, {SUPPORT_MAX:.0%}]",
         "n_bootstrap": N_BOOTSTRAP,
         "dml_folds": DML_N_FOLDS,
         "dml_reps": DML_N_REP,

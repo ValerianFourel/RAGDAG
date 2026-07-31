@@ -316,7 +316,20 @@ def print_comparison(res: pd.DataFrame) -> bool:
 
 
 def plot_dml(res: pd.DataFrame, path=FIG_DML) -> None:
-    """Dot-and-whisker comparison, naive vs DML, per concept."""
+    """Dot-and-whisker comparison, naive vs DML, per concept.
+
+    Returns early on an empty frame. ``select_concepts`` legitimately returns
+    nothing when the concept lexicon does not intersect the collection, and
+    ``print_comparison`` already handles that by reporting INCONCLUSIVE. Without
+    the same guard here the KeyError propagated out of the merge pass and killed
+    the *whole* run - stability and the report included - for two collections
+    whose GPU work had already completed. A stage with nothing to say must not
+    be able to destroy the stages that do.
+    """
+    if res is None or res.empty or "naive_coef" not in res.columns:
+        print("[dml] no concept estimates - skipping figure.")
+        return
+
     import matplotlib
 
     matplotlib.use("Agg")
