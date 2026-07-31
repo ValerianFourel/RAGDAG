@@ -148,6 +148,13 @@ def main() -> int:
         print("error: --repo (or $HF_REPO) is required, e.g. user/ragdag-results")
         return 2
 
+    # This script exists to talk to the network. If a compute-node env leaked
+    # the offline flags in (scripts/env.sh sets them inside a SLURM job), clear
+    # them here rather than failing with OfflineModeIsEnabled.
+    for v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        if os.environ.pop(v, None):
+            print(f"note: cleared {v} - publishing requires network access")
+
     from huggingface_hub import HfApi, snapshot_download
 
     api = HfApi()

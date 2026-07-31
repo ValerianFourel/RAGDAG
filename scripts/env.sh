@@ -17,14 +17,26 @@ export HF_HOME="${HF_HOME:-$RAGDAG_WS/hf}"
 export IR_DATASETS_HOME="${IR_DATASETS_HOME:-$RAGDAG_WS/ir_datasets}"
 export TOKENIZERS_PARALLELISM=false
 
-# --- offline on compute nodes ---------------------------------------------
-# HoreKa compute nodes have no outbound route. Setting these makes a missing
-# cache fail immediately and legibly instead of hanging on a socket until the
-# job's walltime expires.
+# --- offline on compute nodes, ONLINE on login nodes -----------------------
+# HoreKa compute nodes have no outbound route, so inside a job the offline flags
+# make a missing cache fail immediately instead of hanging on a socket until the
+# walltime expires.
+#
+# Login nodes are the opposite case: that is where prefetch downloads models and
+# where publish uploads results, both of which REQUIRE network. Forcing offline
+# unconditionally broke `huggingface-cli login` with OfflineModeIsEnabled.
+#
+# SLURM_JOB_ID is set inside both sbatch and salloc, unset on a bare login node,
+# which is exactly the distinction we need.
 if [ -n "${RAGDAG_ONLINE:-}" ]; then
   unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
-else
+  _ragdag_net="online (forced)"
+elif [ -n "${SLURM_JOB_ID:-}" ]; then
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  _ragdag_net="offline (in SLURM job $SLURM_JOB_ID)"
+else
+  unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
+  _ragdag_net="online (login node)"
 fi
 
 # --- thread budget ---------------------------------------------------------
@@ -46,11 +58,11 @@ echo "RAGDAG env ready"
 echo "  repo        $RAGDAG_DIR"
 echo "  workspace   $RAGDAG_WS"
 echo "  python      $(command -v python) ($(python -V 2>&1))"
-echo "  offline     HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
+echo "  network     $_ragdag_net"
 echo "  threads     $N_TORCH_THREADS"
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "  gpus        $(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ',' | sed 's/,$//')"
 else
   echo "  gpus        none visible (login node?)"
 fi
-unset _ragdag_src _cpus _gpus
+unset _ragdag_src _cpus _gpus _ragdag_net
