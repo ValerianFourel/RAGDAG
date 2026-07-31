@@ -260,12 +260,19 @@ _DENSE_TAG: str = DENSE_MODEL.split("/")[-1]
 #: numbers without erroring.
 DATASET_TAG: str = DATASET.replace("/", "-")
 
+#: Bump when the pickled corpus gains or loses a field. A cache written by an
+#: older format would otherwise still load - `titles` was added and old caches
+#: deserialised fine with every title empty, silently blanking `term_in_title`
+#: and every origin-document title in the published log. Version the key so a
+#: format change forces a rebuild (seconds) instead of degrading in silence.
+CORPUS_FORMAT: int = 2
+
 EMBEDDINGS_CACHE: Path = (
     CACHE_DIR
     / f"doc_emb_{DATASET_TAG}_{_DENSE_TAG}_L{MAX_SEQ_LENGTH}_{PRECISION_TAG}.npz"
 )
 BM25_INDEX_CACHE: Path = CACHE_DIR / f"bm25_{DATASET_TAG}"
-CORPUS_CACHE: Path = CACHE_DIR / f"corpus_{DATASET_TAG}.pkl"
+CORPUS_CACHE: Path = CACHE_DIR / f"corpus_{DATASET_TAG}_v{CORPUS_FORMAT}.pkl"
 
 
 def baseline_cache_path(qids: list[str]) -> Path:

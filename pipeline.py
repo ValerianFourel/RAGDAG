@@ -230,7 +230,7 @@ def load_corpus_and_queries() -> tuple[Corpus, Queries]:
         corpus = Corpus(
             doc_ids=blob["doc_ids"],
             texts=blob["texts"],
-            titles=blob.get("titles") or [""] * len(blob["doc_ids"]),
+            titles=blob["titles"],
             doc_index={d: i for i, d in enumerate(blob["doc_ids"])},
             doc_len=blob["doc_len"],
             doc_content_tokens=[frozenset(s) for s in blob["doc_content_tokens"]],
