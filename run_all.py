@@ -49,6 +49,7 @@ STAGES = {
     4: "dml",
     5: "stability",
     6: "report",
+    7: "admission",
 }
 
 META_PATH = config.RESULTS_DIR / "run_meta.json"
@@ -328,6 +329,36 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
         summ.to_csv(S.OUT_CSV, index=False)
         S.print_summary(summ, sdf)
         S.plot_stability(summ, sdf)
+
+    # -- 7. admission: does the document get retrieved at all? --
+    #
+    # CPU-bound (BM25 + order statistics over the whole corpus), so it lives in
+    # the merge pass. Wrapped: this stage is exploratory and must never be able
+    # to take down the report, which is exactly how two collections were lost
+    # to an unguarded plotting call in the previous run.
+    if 7 in only:
+        t0 = time.time()
+        try:
+            import admission as A
+
+            inter = pd.read_parquet(A.config.RESULTS_DIR / "interventions.parquet")
+            audit = A.audit_predictor(pipe, inter)
+            A.OUT_AUDIT.write_text(json.dumps(audit, indent=2))
+            panel = A.build_admission_panel(pipe, inter)
+            panel.to_parquet(A.OUT_PANEL, index=False)
+            tab = A.contrast_by_support(panel)
+            if not tab.empty:
+                tab.to_csv(config.RESULTS_DIR / "admission_by_support.csv", index=False)
+                print("\n[merge] admission retention by support:")
+                print(tab.to_string(index=False))
+            res = A.fit_cate(panel)
+            if not res.empty:
+                res.to_csv(A.OUT_CATE, index=False)
+                print(res.to_string(index=False))
+            clock.record("admission", time.time() - t0)
+        except Exception as e:  # noqa: BLE001
+            print(f"[merge] admission stage failed ({type(e).__name__}: {e}) - "
+                  "continuing; the rest of the run is unaffected.")
 
     with open(META_PATH, "w") as f:
         json.dump(current_meta(), f, indent=2)
