@@ -180,6 +180,7 @@ class Corpus:
 
     doc_ids: list[str]
     texts: list[str]
+    titles: list[str]
     doc_index: dict[str, int]
     doc_len: np.ndarray  # (N,) token counts
     doc_content_tokens: list[frozenset[str]]
@@ -229,6 +230,7 @@ def load_corpus_and_queries() -> tuple[Corpus, Queries]:
         corpus = Corpus(
             doc_ids=blob["doc_ids"],
             texts=blob["texts"],
+            titles=blob.get("titles") or [""] * len(blob["doc_ids"]),
             doc_index={d: i for i, d in enumerate(blob["doc_ids"])},
             doc_len=blob["doc_len"],
             doc_content_tokens=[frozenset(s) for s in blob["doc_content_tokens"]],
@@ -244,6 +246,7 @@ def load_corpus_and_queries() -> tuple[Corpus, Queries]:
 
     doc_ids: list[str] = []
     texts: list[str] = []
+    titles: list[str] = []
     # BEIR doc schemas differ: nfcorpus has (doc_id, text, title, url), scifact
     # (doc_id, text, title), quora and fiqa have no title at all. Access
     # defensively so a schema difference is a no-op rather than an AttributeError.
@@ -251,6 +254,7 @@ def load_corpus_and_queries() -> tuple[Corpus, Queries]:
         title = (getattr(d, "title", "") or "").strip()
         body = (getattr(d, "text", "") or "").strip()
         doc_ids.append(d.doc_id)
+        titles.append(title)
         texts.append(f"{title} {body}".strip())
 
     doc_len = np.array([len(tokenize(t)) for t in texts], dtype=np.float32)
@@ -258,6 +262,7 @@ def load_corpus_and_queries() -> tuple[Corpus, Queries]:
     corpus = Corpus(
         doc_ids=doc_ids,
         texts=texts,
+        titles=titles,
         doc_index={d: i for i, d in enumerate(doc_ids)},
         doc_len=doc_len,
         doc_content_tokens=doc_content,
@@ -278,6 +283,7 @@ def load_corpus_and_queries() -> tuple[Corpus, Queries]:
             {
                 "doc_ids": doc_ids,
                 "texts": texts,
+                "titles": titles,
                 "doc_len": doc_len,
                 "doc_content_tokens": [set(s) for s in doc_content],
                 "query_ids": qids,

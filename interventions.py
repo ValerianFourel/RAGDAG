@@ -41,6 +41,7 @@ from pipeline import (
 )
 
 OUT_PARQUET = config.RESULTS_DIR / "interventions.parquet"
+OUT_ORIGIN_DOCS = config.RESULTS_DIR / "origin_documents.parquet"
 FIG_EFFECTS = config.RESULTS_DIR / "fig_intervention_effects.png"
 
 
@@ -213,6 +214,97 @@ def sample_control_terms(
 
 
 # --------------------------------------------------------------------------- #
+# do() provenance
+# --------------------------------------------------------------------------- #
+#: Name of the intervention operator. Recorded explicitly so that later
+#: operators (permute, delete, replace) are distinguishable in the same table
+#: rather than being inferred from which columns happen to be populated.
+OPERATOR = "append_term"
+
+
+def term_provenance(
+    corpus: Corpus,
+    doc_id: str,
+    term: str,
+    vs: VocabStats,
+    arm: str,
+    query_tokens: set[str],
+    query_bm25: frozenset[str],
+) -> dict:
+    """Everything about *why this word* was injected into *this query*.
+
+    Computed after the fact from the same inputs the sampler saw, so it adds no
+    RNG draws and cannot perturb which terms were chosen. Recording only
+    ``(doc_id, term)`` would make the published log unauditable: a reader could
+    not tell whether a term was the document's most distinctive word or its
+    least, nor how likely it was to be drawn at all.
+    """
+    i = corpus.idx(doc_id)
+    tf_all = Counter(t for t in content_tokens(corpus.texts[i]) if _is_word(t))
+    df = vs.df.get(term, 0)
+    rec = {
+        "operator": OPERATOR,
+        "term_source": "target_document" if arm == "treatment" else "corpus_vocabulary",
+        "term_tf_in_doc": int(tf_all.get(term, 0)),
+        "term_df_corpus": int(df),
+        "term_doc_freq_pct": float(df / max(1, vs.n_docs)),
+        "term_idf": float(vs.idf(term)),
+        "term_in_title": bool(term in set(content_tokens(corpus.titles[i]))),
+        "term_bm25_form": " ".join(sorted(bm25_terms(term))) or "<stopword/dropped>",
+        "injection_position": "append",
+        "select_prob": float("nan"),
+        "n_candidate_terms": 0,
+    }
+    if arm == "treatment":
+        # Reconstruct the sampler's candidate pool and the exact probability
+        # this term carried. Same filter as sample_treatment_terms.
+        terms, w = tfidf_terms(corpus, doc_id, vs)
+        keep = [
+            j for j, t in enumerate(terms)
+            if t not in query_tokens and not (bm25_terms(t) & query_bm25)
+        ]
+        if keep:
+            kt = [terms[j] for j in keep]
+            kw = w[keep]
+            if kw.sum() <= 0:
+                kw = np.ones(len(kt))
+            p = kw / kw.sum()
+            rec["n_candidate_terms"] = len(kt)
+            rec["term_tfidf_weight"] = float(kw[kt.index(term)]) if term in kt else float("nan")
+            rec["select_prob"] = float(p[kt.index(term)]) if term in kt else float("nan")
+        else:
+            rec["term_tfidf_weight"] = float("nan")
+    else:
+        rec["n_candidate_terms"] = len(vs.control_pool)
+        rec["term_tfidf_weight"] = float("nan")
+        rec["select_prob"] = 1.0 / max(1, len(vs.control_pool))
+    return rec
+
+
+def origin_documents(corpus: Corpus, doc_ids: list[str], snippet_chars: int = 400) -> pd.DataFrame:
+    """The documents that treatment terms were drawn from.
+
+    Published alongside the intervention log so the record is self-contained:
+    a reader can see *which* paper a word like "anterior" came from without
+    re-downloading and re-parsing the collection. Text is truncated to a
+    snippet - enough to identify and audit the document, short of
+    redistributing the corpus.
+    """
+    rows = []
+    for d in sorted(set(doc_ids)):
+        i = corpus.idx(d)
+        rows.append({
+            "doc_id": d,
+            "title": corpus.titles[i],
+            "text_snippet": corpus.texts[i][:snippet_chars],
+            "text_chars": len(corpus.texts[i]),
+            "doc_len_tokens": int(corpus.doc_len[i]),
+            "n_content_tokens": len(corpus.doc_content_tokens[i]),
+        })
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
 # Target selection
 # --------------------------------------------------------------------------- #
 def select_targets(
@@ -293,12 +385,16 @@ def run_interventions(
                     new_rank = res.rank_of(doc_id)
                     di = corpus.idx(doc_id)
                     new_ce = res.ce_score_of(doc_id)
+                    prov_term = term_provenance(
+                        corpus, doc_id, term, vs, arm, qtok, qbm25
+                    )
                     rows.append(
                         {
                             "query_id": qid,
                             "doc_id": doc_id,
                             "term": term,
                             "arm": arm,
+                            **prov_term,
                             "query_text": q0,
                             "injected_query": q1,
                             "base_rank": base_rank,

@@ -59,7 +59,8 @@ One directory per collection, named after its `ir_datasets` id:
   REPORT.md                 human-readable report incl. the PASS/FAIL verdict
   MANIFEST.json             provenance: git SHA, code fingerprint, config, checksums
   baseline_ndcg.json        nDCG@10 per configuration + reranker_helps flag
-  interventions.parquet     one row per (query, doc, term, arm) with all deltas
+  interventions.parquet     one row per do() operation - see below
+  origin_documents.parquet  the documents treatment terms were drawn from
   mediation.parquet         per-pair path decomposition, both first-stage configs
   mediation_ratio.csv       aggregated mediation shares
   dml_comparison.csv        naive OLS vs DoubleML per concept
@@ -67,6 +68,38 @@ One directory per collection, named after its `ir_datasets` id:
   fig_*.png                 figures
   shards/                   per-worker partials (multi-GPU runs)
 ```
+
+## The do() log
+
+`interventions.parquet` is a complete, auditable record of every intervention.
+One row per `do(Q := Q + t)`, carrying not just the outcome but *why that word
+was chosen*:
+
+| column | meaning |
+|---|---|
+| `operator` | which do()-operator (`append_term`); future operators share this table |
+| `injected_query` | the exact query string after the edit |
+| `doc_id` | the **origin document** the treatment term was drawn from |
+| `term` / `arm` | the injected word and whether it was treatment or control |
+| `term_source` | `target_document` vs `corpus_vocabulary` |
+| `term_tf_in_doc` | how often the word occurs in the origin document |
+| `term_df_corpus`, `term_doc_freq_pct`, `term_idf` | corpus-level rarity |
+| `term_tfidf_weight`, `select_prob` | the sampling weight and the exact probability the word carried |
+| `n_candidate_terms` | how many words it was drawn from |
+| `term_in_title` | whether it appears in the origin document's title |
+| `term_bm25_form` | the term as the BM25 index stores it (stemmed, stopword-filtered) |
+| `injection_position` | where in the query the word was placed |
+| `base_*` / `new_*` / `delta_*` | rank, cross-encoder, BM25 and dense score, before and after |
+| `base_censored` | whether the target already sat at the rank sentinel |
+
+Join `doc_id` against `origin_documents.parquet` for the title, a text snippet
+and length of each origin document, so the log is readable without
+re-downloading the collection.
+
+`select_prob` is the auditable part: it says whether a word was the document's
+most distinctive term or a marginal one. Control terms are uniform over the
+admissible vocabulary, so their `select_prob` is flat by construction, and their
+`delta_bm25` is exactly 0 - the invariant the treatment/control contrast rests on.
 
 ## Reading these numbers
 

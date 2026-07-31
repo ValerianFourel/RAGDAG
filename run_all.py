@@ -281,6 +281,9 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
         inter = _load_shards("interventions", n_shards)
         inter.to_parquet(I.OUT_PARQUET, index=False)
         print(f"[merge] wrote {I.OUT_PARQUET.name} ({len(inter)} rows)")
+        docs = I.origin_documents(corpus, inter["doc_id"].tolist())
+        docs.to_parquet(I.OUT_ORIGIN_DOCS, index=False)
+        print(f"[merge] wrote {I.OUT_ORIGIN_DOCS.name} ({len(docs)} origin documents)")
         I.print_summary(inter)
         I.plot_effects(inter)
 
