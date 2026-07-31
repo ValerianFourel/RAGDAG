@@ -789,8 +789,18 @@ def baseline_sanity_check(
     print(f"  Full pipeline  : {full:.4f}")
     print(f"  queries        : {out['n_queries']}")
 
+    # Recorded ranges describe the FULL query set. Applying them to a smoke run
+    # produces false alarms - a 10-query sample of NFCorpus lands at 0.31 purely
+    # by sampling - which trains you to ignore the one warning that matters.
     expected = config.BASELINE_EXPECTATIONS.get(config.DATASET)
-    if expected is None:
+    if expected is not None and config.N_QUERIES is not None:
+        print(
+            f"  (subset run, n={config.N_QUERIES}: recorded range "
+            f"{list(expected)} not applied - it describes the full query set)"
+        )
+        expected = None
+        out["expectation"] = None
+    elif expected is None:
         print(
             f"  NOTE: no recorded expectation for {config.DATASET}. Applying the "
             f"universal floor ({config.BASELINE_FLOOR}) only; record "
@@ -809,11 +819,17 @@ def baseline_sanity_check(
         else:
             print(f"  within recorded range [{lo}, {hi}]")
 
-    if full <= best_single:
+    out["reranker_helps"] = bool(full > best_single)
+    if not out["reranker_helps"]:
+        known = config.DATASET in config.KNOWN_RERANKER_HARMFUL
         print(
-            "  WARNING: full pipeline does NOT beat both single channels - "
-            "the reranker may be mis-wired (or this collection favours one "
-            "channel strongly; check before trusting the mediation shares)."
+            f"  WARNING: full pipeline ({full:.4f}) does NOT beat the best single "
+            f"channel ({best_single:.4f}) - the reranker DEGRADES this collection."
+            + ("\n           This is a known property of this dataset, not a bug: "
+               "ms-marco-MiniLM is trained on web-style queries." if known else
+               "\n           Check for a mis-wired reranker before trusting anything downstream.")
+            + "\n           Mediation shares below still describe causal responsibility "
+              "for the intervention's effect, but NOT a well-configured pipeline."
         )
     if full < config.BASELINE_FLOOR:
         print(

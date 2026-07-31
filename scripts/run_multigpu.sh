@@ -52,8 +52,10 @@ export TOKENIZERS_PARALLELISM=false
 TOTAL_CPUS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
 export N_TORCH_THREADS="${N_TORCH_THREADS:-$(( TOTAL_CPUS / N_GPUS > 0 ? TOTAL_CPUS / N_GPUS : 1 ))}"
 
-mkdir -p logs results/shards
+DS_TAG=$(${PY:-python} -c "import config; print(config.DATASET_TAG)" 2>/dev/null || echo default)
+mkdir -p logs "results/$DS_TAG/shards"
 
+echo "=== dataset: ${DATASET:-<config default>}  (results/$DS_TAG) ==="
 echo "=== launching $N_GPUS worker(s) on GPU(s) [${DEVS[*]}], $N_TORCH_THREADS torch threads each ==="
 
 # Warm the shared read-only caches (corpus, BM25 index, document embeddings)
@@ -67,22 +69,22 @@ corpus, queries = pipeline.load_corpus_and_queries()
 p = pipeline.RetrievalPipeline(corpus)
 p.bm25; p.doc_emb
 print('[warmup] corpus, BM25 index and document embeddings are cached')
-" 2>&1 | tee logs/warmup.log
+" 2>&1 | tee "logs/${DS_TAG}_warmup.log"
 
 pids=()
 for (( i=0; i<N_GPUS; i++ )); do
   CUDA_VISIBLE_DEVICES="${DEVS[$i]}" $PY -u -m run_all \
     --shard "$i" --n-shards "$N_GPUS" "${@:2}" \
-    > "logs/shard_${i}of${N_GPUS}.log" 2>&1 &
+    > "logs/${DS_TAG}_shard_${i}of${N_GPUS}.log" 2>&1 &
   pid=$!
   pids+=("$pid")
-  echo "  worker $i -> GPU ${DEVS[$i]:-cpu} (pid $pid, logs/shard_${i}of${N_GPUS}.log)"
+  echo "  worker $i -> GPU ${DEVS[$i]:-cpu} (pid $pid, logs/${DS_TAG}_shard_${i}of${N_GPUS}.log)"
 done
 
 fail=0
 for i in "${!pids[@]}"; do
   if ! wait "${pids[$i]}"; then
-    echo "!! worker $i FAILED - see logs/shard_${i}of${N_GPUS}.log" >&2
+    echo "!! worker $i FAILED - see logs/${DS_TAG}_shard_${i}of${N_GPUS}.log" >&2
     fail=1
   fi
 done
@@ -92,4 +94,4 @@ if (( fail )); then
 fi
 
 echo "=== all workers finished; merging ==="
-$PY -u -m run_all --merge --n-shards "$N_GPUS" "${@:2}" 2>&1 | tee logs/merge.log
+$PY -u -m run_all --merge --n-shards "$N_GPUS" "${@:2}" 2>&1 | tee "logs/${DS_TAG}_merge.log"

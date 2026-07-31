@@ -231,10 +231,17 @@ RBO_P: float = 0.9
 # --------------------------------------------------------------------------- #
 ROOT: Path = Path(__file__).parent.resolve()
 CACHE_DIR: Path = ROOT / "cache"
-RESULTS_DIR: Path = ROOT / "results"
+
+#: Results are dataset-scoped. Without this a second dataset overwrites the
+#: first: every artefact path (parquets, figures, REPORT.md, run_meta.json) is
+#: a fixed filename, so running SciFact after NFCorpus silently destroyed the
+#: NFCorpus results rather than sitting alongside them.
+RESULTS_ROOT: Path = ROOT / "results"
+RESULTS_DIR: Path = RESULTS_ROOT / DATASET.replace("/", "-")
 
 CACHE_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+RESULTS_ROOT.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 #: Precision tag for cache keys. fp16/TF32 change the numbers, so artefacts
 #: computed under one precision must not be silently reused under another.
@@ -286,11 +293,21 @@ def baseline_cache_path(qids: list[str]) -> Path:
 #: first clean run on a dataset rather than guessing a range up front.
 BASELINE_EXPECTATIONS: dict[str, tuple[float, float] | None] = {
     "beir/nfcorpus/test": (0.33, 0.38),   # observed 0.3568 at K=50/ce512
-    "beir/scifact/test": None,
+    # SciFact observed 0.6695 at K=20/ce192 (CPU profile), 300 queries. NOTE:
+    # this is a *degraded* pipeline - see RERANKER_HELPS below.
+    "beir/scifact/test": (0.62, 0.78),
     "beir/scidocs": None,
     "beir/quora/test": None,
     "beir/fiqa/test": None,
 }
+
+#: Collections where the cross-encoder is known NOT to improve over the best
+#: single channel. ms-marco-MiniLM is trained on web-style queries; on SciFact's
+#: scientific claims it actively degrades the ranking (0.6695 full vs 0.7127
+#: dense). Mediation shares on such a collection describe causal responsibility
+#: for an intervention's effect, NOT a well-configured pipeline - the report
+#: must say so rather than let the two be conflated.
+KNOWN_RERANKER_HARMFUL: frozenset[str] = frozenset({"beir/scifact/test"})
 
 #: Universal floor. Below this the pipeline is broken on any collection.
 BASELINE_FLOOR: float = 0.15

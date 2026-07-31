@@ -1,8 +1,12 @@
 #!/bin/bash
 # RAGDAG on HoreKa (KIT) - 4x A100-40 on one node, query-sharded.
 #
-#   sbatch scripts/horeka.sbatch                    # full run, 323 queries
-#   sbatch --export=ALL,N_QUERIES=30 scripts/horeka.sbatch   # smoke test
+#   sbatch scripts/horeka.sbatch                             # default dataset
+#   sbatch --export=ALL,DATASET=beir/scifact/test scripts/horeka.sbatch
+#   sbatch --export=ALL,N_QUERIES=30 scripts/horeka.sbatch    # smoke test
+#
+# Results are written to results/<dataset-tag>/ so datasets never overwrite
+# each other. DATASET must also have been prefetched on the login node.
 #
 # Prerequisite: run scripts/prefetch.py on a LOGIN node first. HoreKa compute
 # nodes have no outbound internet, so the models and dataset must already be in
@@ -41,6 +45,7 @@ source .venv/bin/activate
 echo "=================================================================="
 echo "job          $SLURM_JOB_ID on $(hostname)"
 echo "partition    ${SLURM_JOB_PARTITION:-?}   cpus/task ${SLURM_CPUS_PER_TASK:-?}"
+echo "DATASET      ${DATASET:-<config default>}"
 echo "HF_HOME      $HF_HOME"
 echo "started      $(date)"
 echo "=================================================================="
@@ -56,4 +61,4 @@ srun --ntasks=1 --export=ALL bash scripts/run_multigpu.sh
 
 echo "------------------------------------------------------------------"
 echo "finished     $(date)"
-echo "verdict is at the end of logs/merge.log and in results/REPORT.md"
+python -c "import config; print('results ->', config.RESULTS_DIR)"

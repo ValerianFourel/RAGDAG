@@ -313,9 +313,20 @@ def build_report(path=REPORT_PATH) -> str:
                 "pipeline that actually works.\n"
             )
         else:
+            known = a.ndcg.get("dataset") in config.KNOWN_RERANKER_HARMFUL
             add(
-                "**Warning:** the full pipeline does not beat both single channels. "
-                "Effects measured downstream may be artefacts of a mis-wired pipeline.\n"
+                f"> **The reranker degrades this collection.** Full pipeline "
+                f"{a.ndcg['full_pipeline']:.4f} vs best single channel "
+                f"{best_single:.4f}.\n>\n"
+                + ("> This is a known property of this dataset rather than a "
+                   "configuration error: the MS MARCO-trained cross-encoder does not "
+                   "transfer to this query style.\n>\n" if known else
+                   "> Check for a mis-wired reranker before trusting anything below.\n>\n")
+                + "> Every mediation share below therefore describes causal "
+                  "responsibility for the *intervention's effect*, on a pipeline whose "
+                  "reranking stage is not beneficial. Causal responsibility and "
+                  "usefulness are different questions; do not report the shares as "
+                  "evidence that this configuration works.\n"
             )
 
     # ---- interventions ----
