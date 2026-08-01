@@ -309,10 +309,15 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
 
     if 4 in only:
         t0 = time.time()
+        res = None
         if D.OUT_CSV.exists() and not stale:
-            res = pd.read_csv(D.OUT_CSV)
-            print(f"[merge] reusing {D.OUT_CSV.name}")
-        else:
+            try:
+                res = pd.read_csv(D.OUT_CSV)
+                print(f"[merge] reusing {D.OUT_CSV.name}")
+            except pd.errors.EmptyDataError:
+                # headerless CSV from a zero-concept run under the old writer
+                print(f"[merge] {D.OUT_CSV.name} unreadable - recomputing")
+        if res is None:
             concepts = D.select_concepts(corpus)
             panel = D.build_panel(pipe, queries, baseline, [c for c, _ in concepts])
             panel.to_parquet(D.OUT_PANEL, index=False)
@@ -351,6 +356,11 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
                 tab.to_csv(config.RESULTS_DIR / "admission_by_support.csv", index=False)
                 print("\n[merge] admission retention by support:")
                 print(tab.to_string(index=False))
+            surg = A.surgical_by_support(panel)
+            if not surg.empty:
+                surg.to_csv(A.OUT_SURGICAL, index=False)
+                print("\n[merge] surgical same-word decomposition:")
+                print(surg.to_string(index=False))
             res = A.fit_cate(panel)
             if not res.empty:
                 res.to_csv(A.OUT_CATE, index=False)

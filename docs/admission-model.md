@@ -94,6 +94,22 @@ This splits the two arms cleanly, and the split is exact rather than assumed:
   effect net of interference, and the control arm alone identifies the
   interference effect.
 
+The arm contrast compares two *different* words matched on support. The panel
+additionally evaluates a **surgical same-word decomposition** — four worlds per
+injection from the same closed-form deltas, with the channels toggled
+separately: `Y00` (nobody boosted), `Y10` (target only), `Y01` (competitors
+only), `Y11` (both — the real intervention). `Y10−Y00` is direct benefit,
+`Y01−Y00` interference, `Y11−Y10−Y01+Y00` their interaction; the word, its
+IDF, its co-treated set and every increment are held fixed. Two arithmetic
+facts: conditional on baseline admission `Y10 == Y00` (a boost cannot eject
+its recipient), so the own-boost benefit surfaces entirely as the interaction;
+conditional on baseline exclusion, `Y10−Y00` is pure own-lift rescue — the
+module's first recall-side quantity. The panel also logs `threat_count`:
+co-treated competitors whose own boost is large enough to overtake the
+target's baseline score. Support counts every document the word touches;
+only these can displace — it is a mediator (post-treatment), so it belongs
+in the structural analysis, never in the DML adjustment set.
+
 ---
 
 ## 4. Results (NFCorpus, 40-query smoke, support/lift sampler)
@@ -186,8 +202,9 @@ python -m run_all --merge --n-shards 4 --only 7
 ```
 
 Artefacts, per dataset: `admission_panel.parquet`, `admission_audit.json`,
-`admission_by_support.csv`, `admission_cate.csv`. All match `publish.py`'s
-existing include globs, so they publish without changes.
+`admission_by_support.csv`, `admission_cate.csv`, `admission_surgical.csv`.
+All match `publish.py`'s existing include globs, so they publish without
+changes.
 
 **Cost.** Postings build is O(corpus tokens), cached per dataset: 2.3s on
 NFCorpus, ~2 min on TREC-COVID. The panel loop is two order statistics per row

@@ -36,6 +36,18 @@ This yields a clean decomposition of the two arms:
 * **treatment** terms move both. The contrast therefore identifies the direct
   effect, and the control arm alone identifies the interference effect.
 
+The arm contrast compares two *different* words matched on support. The panel
+additionally evaluates a **surgical same-word decomposition**: four worlds per
+injection, from the same closed-form deltas, with the two channels switched on
+and off separately::
+
+    Y00  nobody boosted            Y10  target only
+    Y01  competitors only          Y11  both  (= the real intervention)
+
+so ``Y10-Y00`` is the word's direct benefit, ``Y01-Y00`` its interference, and
+``Y11-Y10-Y01+Y00`` their interaction - with the word, its IDF, its co-treated
+set and every score increment held fixed across the four worlds.
+
 Run standalone::
 
     python -m admission                    # audit + panel + CATE on $DATASET
@@ -59,6 +71,7 @@ from pipeline import RetrievalPipeline, load_corpus_and_queries
 OUT_PANEL = config.RESULTS_DIR / "admission_panel.parquet"
 OUT_AUDIT = config.RESULTS_DIR / "admission_audit.json"
 OUT_CATE = config.RESULTS_DIR / "admission_cate.csv"
+OUT_SURGICAL = config.RESULTS_DIR / "admission_surgical.csv"
 
 #: bm25s "lucene" method, matching RetrievalPipeline's index exactly. A
 #: mismatch here would silently turn an exact prediction into an approximate
@@ -245,6 +258,33 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
         pred = predict_admission(base, ids, deltas, di, k)
         bnd = boundary(base, k)
 
+        # --- surgical same-word decomposition (four worlds) ------------------
+        # Same term, same deltas; only who receives the boost changes, so the
+        # contrast is within-word rather than across two matched words. All
+        # four worlds go through `admitted` so tie handling is identical.
+        # For a control term the target delta is exactly 0, hence Y10 == Y00
+        # and Y11 == Y01 by construction.
+        hit_d = np.where(ids == di)[0]
+        d_target = float(deltas[hit_d[0]]) if len(hit_d) else 0.0
+        y00 = admitted(base, di, k)
+        world = base.copy()
+        world[ids] += deltas
+        y11 = admitted(world, di, k)                # both channels on
+        world[di] -= d_target
+        y01 = admitted(world, di, k)                # competitors only
+        if d_target:
+            world = base.copy()
+            world[di] += d_target
+            y10 = admitted(world, di, k)            # target only
+        else:
+            y10 = y00
+
+        # Boundary-threat count: co-treated competitors whose own boost is
+        # large enough to overtake the target's *baseline* score. Support
+        # counts every document the word touches; only these can displace.
+        mask = ids != di
+        threat = int((base[ids[mask]] + deltas[mask] > base[di]).sum())
+
         # Support and lift in BM25 space, so the model's coordinates are the
         # scoring function's own rather than a differently-tokenised proxy.
         t_ids, t_tf = post.get(bt[0], (np.zeros(0, int), np.zeros(0)))
@@ -269,7 +309,14 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
             **{f"boundary_{kk}": v for kk, v in bnd.items()},
             # --- closed-form prediction ------------------------------------
             **pred,
-            "direct_delta": float(deltas[np.where(ids == di)[0][0]]) if di in set(ids.tolist()) else 0.0,
+            "direct_delta": d_target,
+            # --- surgical worlds: channels switched separately --------------
+            "y00": bool(y00), "y10": bool(y10), "y01": bool(y01), "y11": bool(y11),
+            "surg_direct": int(y10) - int(y00),
+            "surg_interference": int(y01) - int(y00),
+            "surg_total": int(y11) - int(y00),
+            "surg_interaction": int(y11) - int(y10) - int(y01) + int(y00),
+            "threat_count": threat,
         })
         if n % 500 == 0:
             print(f"[admission] {n}/{len(inter)} rows, {time.time() - t0:.0f}s", flush=True)
@@ -295,7 +342,7 @@ def audit_predictor(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) 
     post, dl = build_postings(corpus)
     avgdl, n_docs, k = float(dl.mean()), len(corpus), config.K_CANDIDATES
 
-    worst_score, adm_agree, checked = 0.0, 0, 0
+    worst_score, max_score, adm_agree, checked = 0.0, 0.0, 0, 0
     sub = inter.drop_duplicates(subset=["query_id", "term"]).head(n)
     for r in sub.itertuples():
         bt = sorted(bm25_terms(r.term))
@@ -307,6 +354,7 @@ def audit_predictor(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) 
         pred = base.copy()
         pred[ids] += deltas
         worst_score = max(worst_score, float(np.abs(pred - truth).max()))
+        max_score = max(max_score, float(np.abs(truth).max()))
         try:
             di = corpus.idx(r.doc_id)
         except Exception:
@@ -314,14 +362,23 @@ def audit_predictor(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) 
         adm_agree += int(admitted(pred, di, k) == admitted(truth, di, k))
         checked += 1
 
+    # The index stores float32, so the best achievable agreement is a few ulps
+    # of the *largest score in play* - an absolute cutoff flags fp32 rounding
+    # as "inexact" on any collection whose BM25 scores exceed ~8 (every error
+    # ever observed here is exactly 1 ulp of the max score). 8 ulps is still
+    # orders of magnitude below the defects this audit exists to catch (a 2.5x
+    # scale factor, percent-level document-length errors).
+    tol = 8.0 * float(np.finfo(np.float32).eps) * max(1.0, max_score)
     out = {
         "n_checked": checked,
         "max_abs_score_error": worst_score,
+        "max_abs_score": max_score,
+        "tolerance": tol,
         "admission_agreement": adm_agree / max(1, checked),
-        "exact": bool(worst_score < 1e-6),
+        "exact": bool(worst_score <= tol),
     }
     print(f"[admission] predictor audit: {checked} injections, "
-          f"max |score error| = {worst_score:.3e}, "
+          f"max |score error| = {worst_score:.3e} (tol {tol:.3e}), "
           f"admission agreement = {out['admission_agreement']:.4f}")
     return out
 
@@ -361,6 +418,48 @@ def contrast_by_support(panel: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(recs)
 
 
+def surgical_by_support(panel: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate the four-world same-word decomposition.
+
+    Complements the arm contrast: there, two *different* words are compared,
+    matched on support but potentially touching differently-placed competitor
+    sets; here nothing varies between the compared worlds except which channel
+    is switched on. Two arithmetic facts shape the table:
+
+    * conditional on baseline admission, ``Y10 == Y00`` always - boosting an
+      admitted target cannot eject it - so in that stratum the entire benefit
+      of the target's own boost surfaces as the **interaction**: the boost
+      rescuing the target from displacement that interference alone would
+      have caused;
+    * conditional on baseline exclusion, ``Y10 - Y00`` is **pure own-lift
+      rescue** - the first recall-side quantity this module produces.
+    """
+    if panel.empty:
+        return pd.DataFrame()
+    recs = []
+    for (arm, adm), g0 in panel.groupby(["arm", "base_admitted"]):
+        if len(g0) < 10:
+            continue
+        bins = pd.qcut(g0["support"], min(6, g0["support"].nunique()),
+                       duplicates="drop")
+        for b, g in g0.groupby(bins, observed=True):
+            if len(g) < 10:
+                continue
+            recs.append({
+                "arm": arm, "base_admitted": bool(adm),
+                "support_bin": str(b),
+                "median_support": float(g["support"].median()),
+                "n": len(g),
+                "direct_y10_y00": float(g["surg_direct"].mean()),
+                "interference_y01_y00": float(g["surg_interference"].mean()),
+                "total_y11_y00": float(g["surg_total"].mean()),
+                "interaction": float(g["surg_interaction"].mean()),
+                "mean_threat_count": float(g["threat_count"].mean()),
+                "mean_cotreated": float(g["n_cotreated"].mean()),
+            })
+    return pd.DataFrame(recs)
+
+
 #: Covariates for the arm contrast. Deliberately **excludes lift**.
 #:
 #: Control terms are absent from the target document by construction, so their
@@ -374,6 +473,11 @@ def contrast_by_support(panel: pd.DataFrame) -> pd.DataFrame:
 #: matches the arms bin-for-bin on support, so it is balanced by design and
 #: conditioning on it buys nothing. It belongs on the dose-response axis, not
 #: in the adjustment set.
+#:
+#: ``threat_count`` is excluded too: it is a function of the injected term
+#: (post-treatment), so it is a mediator of the effect, not a confounder.
+#: It belongs in the structural analysis of *why* displacement happens, next
+#: to support and margin - never in X.
 ARM_CONTRAST_X = ["base_margin", "boundary_cut_gap", "boundary_n_within_5pct_below",
                   "boundary_n_nonzero"]
 
@@ -487,6 +591,13 @@ def main() -> int:
         print("\nAdmission retention by support "
               "(control = pure interference; treatment - control = direct effect)")
         print(tab.to_string(index=False))
+
+    surg = surgical_by_support(panel)
+    if not surg.empty:
+        surg.to_csv(OUT_SURGICAL, index=False)
+        print("\nSurgical same-word decomposition "
+              "(Y10=target only, Y01=competitors only, Y11=both):")
+        print(surg.to_string(index=False))
 
     if not args.no_cate:
         res = fit_cate(panel)
