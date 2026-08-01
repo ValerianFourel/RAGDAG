@@ -284,6 +284,16 @@ def analyse(df: pd.DataFrame, concepts: list[tuple[str, float]]) -> pd.DataFrame
         recs.append(rec)
         print(f"[dml] {term}: naive={rec['naive_coef']:+.4f} dml={rec['dml_coef']:+.4f} "
               f"({rec['seconds']:.1f}s)", flush=True)
+    if not recs:
+        # Zero concepts (the lexicon does not intersect this corpus). Return a
+        # frame that still carries the schema: a column-less frame writes a
+        # headerless CSV, which pd.read_csv cannot parse at all.
+        return pd.DataFrame(columns=[
+            "concept", "doc_freq", "n_treated", "n_units",
+            "naive_coef", "naive_se", "naive_ci_lo", "naive_ci_hi",
+            "dml_coef", "dml_se", "dml_ci_lo", "dml_ci_hi", "dml_pval",
+            "naive_outside_dml_ci", "abs_shift", "seconds",
+        ])
     return pd.DataFrame(recs)
 
 

@@ -65,7 +65,12 @@ def load_artifacts() -> Artifacts:
         a.mediation = pd.read_parquet(M.OUT_PARQUET)
         a.ratio = M.mediation_ratio(a.mediation)
     if D.OUT_CSV.exists():
-        a.dml = pd.read_csv(D.OUT_CSV)
+        try:
+            a.dml = pd.read_csv(D.OUT_CSV)
+        except pd.errors.EmptyDataError:
+            # A zero-concept run used to write a headerless CSV; treat it the
+            # same as the file being absent rather than killing the report.
+            a.dml = None
     if S.OUT_PARQUET.exists():
         a.stability_raw = pd.read_parquet(S.OUT_PARQUET)
         a.stability = S.summarize(a.stability_raw)
@@ -448,7 +453,14 @@ def build_report(path=REPORT_PATH) -> str:
 
     # ---- DML ----
     add("## 4. Is naive attribution confounded?\n")
-    if a.dml is not None:
+    if a.dml is None or a.dml.empty:
+        add(
+            "**INCONCLUSIVE** — no concept terms were analysed. The concept "
+            "lexicon does not intersect this corpus in the required document-"
+            "frequency band, so Module 4 produced no estimates. This is a "
+            "coverage gap of the lexicon, not evidence of no confounding.\n"
+        )
+    else:
         add(
             "Observational analysis of the **baseline** run: units are (query, "
             "candidate document) pairs, treatment D is *document contains concept c*, "
