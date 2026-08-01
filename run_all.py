@@ -50,6 +50,7 @@ STAGES = {
     5: "stability",
     6: "report",
     7: "admission",
+    8: "dense_admission",
 }
 
 META_PATH = config.RESULTS_DIR / "run_meta.json"
@@ -368,6 +369,43 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
             clock.record("admission", time.time() - t0)
         except Exception as e:  # noqa: BLE001
             print(f"[merge] admission stage failed ({type(e).__name__}: {e}) - "
+                  "continuing; the rest of the run is unaffected.")
+
+    # -- 8. dense admission: the same four worlds, no closed form --
+    #
+    # Needs the dense encoder (GPU strongly preferred) plus the stage-7 panel
+    # for the union gate; degrades gracefully without either. Wrapped for the
+    # same reason as stage 7.
+    if 8 in only:
+        t0 = time.time()
+        try:
+            import dense_admission as DA
+
+            inter = pd.read_parquet(config.RESULTS_DIR / "interventions.parquet")
+            audit = DA.audit_dense(pipe, inter)
+            DA.OUT_AUDIT.write_text(json.dumps(audit, indent=2))
+            if not audit["exact"]:
+                raise RuntimeError("dense score-delta audit failed; panel skipped")
+            dpanel = DA.build_dense_panel(pipe, inter)
+            dpanel = DA.join_lexical(dpanel)
+            dpanel.to_parquet(DA.OUT_PANEL, index=False)
+            tab = DA.dense_by_bin(dpanel)
+            if not tab.empty:
+                tab.to_csv(DA.OUT_BY_BIN, index=False)
+                print("\n[merge] dense four-world decomposition:")
+                show = [c for c in tab.columns if not c.endswith(("_lo", "_hi"))]
+                print(tab[show].to_string(index=False))
+            ug = DA.union_gate(dpanel)
+            if not ug.empty:
+                ug.to_csv(DA.OUT_UNION, index=False)
+                print("\n[merge] union gate (BM25 OR dense):")
+                print(ug.to_string(index=False))
+            models = DA.mechanistic_models(dpanel)
+            if not models.empty:
+                models.to_csv(DA.OUT_MODELS, index=False)
+            clock.record("dense_admission", time.time() - t0)
+        except Exception as e:  # noqa: BLE001
+            print(f"[merge] dense admission stage failed ({type(e).__name__}: {e}) - "
                   "continuing; the rest of the run is unaffected.")
 
     with open(META_PATH, "w") as f:
