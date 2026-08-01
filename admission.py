@@ -59,7 +59,7 @@ from __future__ import annotations
 import argparse
 import pickle
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -218,6 +218,82 @@ def predict_admission(base: np.ndarray, ids: np.ndarray, deltas: np.ndarray,
 
 
 # --------------------------------------------------------------------------- #
+# GPU backend for the world evaluations
+# --------------------------------------------------------------------------- #
+class _WorldsGPU:
+    """Evaluates the four worlds and top-K stats on a CUDA device.
+
+    fp64 throughout: additions and >=-comparisons are exact IEEE operations,
+    so the GPU changes wall-clock, not results (injected-term postings have
+    unique doc indices, so the scatter-add has no nondeterministic collisions).
+    Membership is decided by ``score >= K-th largest``, matching `admitted`.
+
+    Per-query state (base tensor, its K-th score, its top-K set) lives in a
+    small LRU rather than an unbounded cache: intervention rows arrive grouped
+    by query, and a Quora-sized fp64 base vector is ~4 MB - caching every
+    query would not fit a 40 GB card.
+    """
+
+    def __init__(self, k: int):
+        import torch
+
+        self.torch = torch
+        self.dev = torch.device("cuda")
+        self.k = k
+        self._cache: OrderedDict[str, tuple] = OrderedDict()
+
+    def _query_state(self, key: str, base: np.ndarray) -> tuple:
+        st = self._cache.get(key)
+        if st is None:
+            t = self.torch.as_tensor(base, dtype=self.torch.float64, device=self.dev)
+            topv, topi = self.torch.topk(t, self.k)
+            st = (t, float(topv[-1].item()), set(topi.tolist()))
+            self._cache[key] = st
+            if len(self._cache) > 8:
+                self._cache.popitem(last=False)
+        else:
+            self._cache.move_to_end(key)
+        return st
+
+    def evaluate(self, qkey: str, base: np.ndarray, ids: np.ndarray,
+                 deltas: np.ndarray, di: int, d_target: float
+                 ) -> tuple[bool, bool, bool, bool, dict]:
+        torch = self.torch
+        base_t, kth0, top_old = self._query_state(qkey, base)
+        y00 = bool(base[di] >= kth0)
+
+        ids_t = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
+        del_t = torch.as_tensor(deltas, dtype=torch.float64, device=self.dev)
+        new = base_t.clone()
+        new.index_put_((ids_t,), del_t, accumulate=True)
+        topv, topi = torch.topk(new, self.k)
+        s_new, kth11 = new[di], topv[-1]
+        y11 = bool((s_new >= kth11).item())
+        top_new = set(topi.tolist())
+        pred = {
+            "pred_admitted": y11,
+            "pred_entrants": len(top_new - top_old),
+            "pred_churn": len(top_new ^ top_old),
+            "pred_score_new": float(s_new.item()),
+            "pred_margin_new": float((s_new - kth11).item()),
+            "n_cotreated": int(len(ids)),
+        }
+        if d_target:
+            new[di] -= d_target                       # competitors only
+            kth01 = torch.topk(new, self.k).values[-1]
+            y01 = bool((new[di] >= kth01).item())
+            v = base_t.clone()                        # target only
+            v[di] += d_target
+            kth10 = torch.topk(v, self.k).values[-1]
+            y10 = bool((v[di] >= kth10).item())
+        else:
+            # control: the target's delta is exactly 0, so the mixed worlds
+            # coincide with the pure ones - no extra kernels needed.
+            y01, y10 = y11, y00
+        return y00, y10, y01, y11, pred
+
+
+# --------------------------------------------------------------------------- #
 # Panel
 # --------------------------------------------------------------------------- #
 def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
@@ -237,8 +313,20 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
 
     rows: list[dict] = []
     base_cache: dict[str, np.ndarray] = {}
+    bnd_cache: dict[str, dict] = {}
     if limit:
         inter = inter.head(limit)
+
+    gpu = None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            gpu = _WorldsGPU(k)
+            print(f"[admission] world evaluations on "
+                  f"{torch.cuda.get_device_name(0)} (fp64)")
+    except Exception as e:  # noqa: BLE001 - GPU is an accelerator, never a requirement
+        print(f"[admission] GPU backend unavailable ({e}) - using numpy")
 
     t0 = time.time()
     for n, r in enumerate(inter.itertuples(), 1):
@@ -255,29 +343,34 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
         if len(bt) != 1:
             continue  # multi-stem or stopword-only injection: not a clean single-term do()
         ids, deltas = bm25_delta(bt[0], post, dl, avgdl, n_docs)
-        pred = predict_admission(base, ids, deltas, di, k)
-        bnd = boundary(base, k)
+        hit_d = np.where(ids == di)[0]
+        d_target = float(deltas[hit_d[0]]) if len(hit_d) else 0.0
+        bnd = bnd_cache.get(q0)
+        if bnd is None:
+            bnd = bnd_cache[q0] = boundary(base, k)  # depends on base only
 
         # --- surgical same-word decomposition (four worlds) ------------------
         # Same term, same deltas; only who receives the boost changes, so the
         # contrast is within-word rather than across two matched words. All
-        # four worlds go through `admitted` so tie handling is identical.
-        # For a control term the target delta is exactly 0, hence Y10 == Y00
-        # and Y11 == Y01 by construction.
-        hit_d = np.where(ids == di)[0]
-        d_target = float(deltas[hit_d[0]]) if len(hit_d) else 0.0
-        y00 = admitted(base, di, k)
-        world = base.copy()
-        world[ids] += deltas
-        y11 = admitted(world, di, k)                # both channels on
-        world[di] -= d_target
-        y01 = admitted(world, di, k)                # competitors only
-        if d_target:
-            world = base.copy()
-            world[di] += d_target
-            y10 = admitted(world, di, k)            # target only
+        # four worlds use the same >= K-th-value membership rule so tie
+        # handling is identical. For a control term the target delta is
+        # exactly 0, hence Y10 == Y00 and Y11 == Y01 by construction.
+        if gpu is not None:
+            y00, y10, y01, y11, pred = gpu.evaluate(q0, base, ids, deltas, di, d_target)
         else:
-            y10 = y00
+            pred = predict_admission(base, ids, deltas, di, k)
+            y00 = admitted(base, di, k)
+            world = base.copy()
+            world[ids] += deltas
+            y11 = admitted(world, di, k)            # both channels on
+            world[di] -= d_target
+            y01 = admitted(world, di, k)            # competitors only
+            if d_target:
+                world = base.copy()
+                world[di] += d_target
+                y10 = admitted(world, di, k)        # target only
+            else:
+                y10 = y00
 
         # Boundary-threat count: co-treated competitors whose own boost is
         # large enough to overtake the target's *baseline* score. Support
@@ -305,7 +398,7 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
             # --- pre-treatment state ---------------------------------------
             "base_score": float(base[di]),
             "base_margin": float(base[di] - bnd["cut"]),
-            "base_admitted": bool(admitted(base, di, k)),
+            "base_admitted": bool(y00),
             **{f"boundary_{kk}": v for kk, v in bnd.items()},
             # --- closed-form prediction ------------------------------------
             **pred,
