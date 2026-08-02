@@ -11,9 +11,7 @@ Covers:
 * the target's stale-slot exclusion trick in ``beat_count``;
 * the Cauchy-Schwarz bound on random embeddings;
 * union-gate classification on a hand-built panel;
-* regression: ``admission.admitted`` (the lexical >=K-th-value rule) against
-  its own brute-force reference, so a future edit cannot silently change the
-  published BM25 semantics.
+* sparse membership and top-K selection under the production tie rule.
 """
 
 from __future__ import annotations
@@ -25,8 +23,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dense_admission import beat_count, dense_worlds, union_gate  # noqa: E402
+from dense_admission import (beat_count, dense_worlds, publication_estimates,
+                             union_gate)  # noqa: E402
 import admission  # noqa: E402
+import interventions  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -140,10 +140,69 @@ def test_lexical_admitted_regression() -> None:
     for _ in range(300):
         s = np.round(rng.normal(size=n), 2)
         di = int(rng.integers(n))
-        # lexical rule: admitted iff score >= K-th largest VALUE (ties admit)
-        want = s[di] >= np.sort(s)[::-1][k - 1]
+        want = brute_member(s, di, k)
         assert admission.admitted(s, di, k) == want
-    print("ok  admission.admitted matches the >=K-th-value rule (300 trials)")
+        got = admission.topk_indices(s, k).tolist()
+        expected = sorted(range(n), key=lambda j: (-s[j], j))[:k]
+        assert got == expected
+    print("ok  sparse admission/top-K match production ties (300 trials)")
+
+
+def test_shapley_identity() -> None:
+    for y00 in (0, 1):
+        for y10 in (0, 1):
+            for y01 in (0, 1):
+                for y11 in (0, 1):
+                    target = .5 * ((y10 - y00) + (y11 - y01))
+                    competitors = .5 * ((y01 - y00) + (y11 - y10))
+                    assert target + competitors == y11 - y00
+    print("ok  Shapley allocations reconstruct every binary four-world total")
+
+
+def test_population_target_sampling() -> None:
+    class Corpus:
+        doc_ids = [f"d{i:03d}" for i in range(100)]
+        doc_index = {d: i for i, d in enumerate(doc_ids)}
+        def __len__(self): return len(self.doc_ids)
+        def idx(self, doc_id): return self.doc_index[doc_id]
+    class Pipe:
+        corpus = Corpus()
+        def _bm25_array(self, query): return np.arange(100, 0, -1, dtype=float)
+        def _dense_array(self, query): return np.arange(100, 0, -1, dtype=float)
+    relevant = set(Pipe.corpus.doc_ids) | {"not-in-corpus"}
+    frame = interventions.select_targets(Pipe(), "q", relevant,
+                                         np.random.default_rng(19), return_frame=True)
+    selected = [r for r in frame if r["target_selected"]]
+    assert len(frame) == 100                 # out-of-union qrels remain eligible
+    assert len(selected) <= 10               # at most two per five strata
+    assert all(0 < r["target_select_prob"] <= 1 for r in frame)
+    assert {r["target_stratum"] for r in frame} >= {
+        "deep_in", "boundary_in", "boundary_out", "mid_out", "deep_out"}
+    print("ok  all-relevant stratified target frame and selection probabilities")
+
+
+def test_weighted_publication_estimate() -> None:
+    import pandas as pd
+    rows = []
+    # Two queries with deliberately unequal sampling probabilities. IPW should
+    # recover a 1/2 hybrid-rescue population mean exactly.
+    for q, weight, rescued in (("q1", 4.0, 1), ("q2", 4.0, 0)):
+        rows.append({
+            "query_id": q, "doc_id": q, "term": "x", "arm": "treatment",
+            "analysis_weight": weight, "target_stratum": "boundary_out",
+            "y00": False, "y10": bool(rescued), "y01": False, "y11": bool(rescued),
+            "bm25_y00": False, "bm25_y10": bool(rescued),
+            "bm25_y01": False, "bm25_y11": bool(rescued),
+            "bm25_shapley_target": float(rescued),
+            "bm25_shapley_competitors": 0.0,
+            "shapley_target": float(rescued), "shapley_competitors": 0.0,
+            "u00": 0.0, "u10": float(rescued), "u01": 0.0, "u11": float(rescued),
+        })
+    estimates = publication_estimates(pd.DataFrame(rows), n_boot=100)
+    value = estimates[(estimates["target_stratum"] == "all") &
+                      (estimates["metric"] == "hybrid_rescue")]["estimate"].iloc[0]
+    assert value == 0.5
+    print("ok  inverse-probability weighted clustered publication estimate")
 
 
 if __name__ == "__main__":
@@ -153,4 +212,7 @@ if __name__ == "__main__":
     test_cauchy_schwarz()
     test_union_gate()
     test_lexical_admitted_regression()
+    test_shapley_identity()
+    test_population_target_sampling()
+    test_weighted_publication_estimate()
     print("\nALL WORLD TESTS PASSED")

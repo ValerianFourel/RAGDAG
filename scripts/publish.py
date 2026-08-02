@@ -138,8 +138,16 @@ def result_dirs(only: str | None) -> list[Path]:
         return []
     if only:
         d = config.RESULTS_ROOT / only.replace("/", "-")
-        return [d] if d.is_dir() else []
-    return sorted(p for p in config.RESULTS_ROOT.iterdir() if p.is_dir())
+        if not (d / "run_meta.json").is_file():
+            return []
+        meta = json.loads((d / "run_meta.json").read_text())
+        return [d] if meta.get("experiment_version") == config.EXPERIMENT_VERSION else []
+    return sorted(
+        p for p in config.RESULTS_ROOT.iterdir()
+        if p.is_dir() and (p / "run_meta.json").is_file()
+        and json.loads((p / "run_meta.json").read_text()).get("experiment_version")
+        == config.EXPERIMENT_VERSION
+    )
 
 
 def write_manifest(d: Path) -> dict:
@@ -150,13 +158,17 @@ def write_manifest(d: Path) -> dict:
         and any(p.match(g) for g in INCLUDE)
     )
     meta_path = d / "run_meta.json"
+    run_meta = json.loads(meta_path.read_text()) if meta_path.exists() else None
+    if not run_meta or run_meta.get("experiment_version") != config.EXPERIMENT_VERSION:
+        raise RuntimeError(f"{d} has no current run-time provenance; refusing publication")
     manifest = {
         "dataset": d.name,
         "published_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "git_sha": _git("rev-parse", "HEAD"),
         "git_dirty": bool(_git("status", "--porcelain")),
-        "code_fingerprint": config.code_fingerprint(),
-        "run_meta": json.loads(meta_path.read_text()) if meta_path.exists() else None,
+        # Provenance belongs to the run, not to whatever tree publishes it later.
+        "code_fingerprint": run_meta["code"],
+        "run_meta": run_meta,
         "files": {
             str(p.relative_to(d)): {"bytes": p.stat().st_size, "sha256_16": _sha256(p)}
             for p in files

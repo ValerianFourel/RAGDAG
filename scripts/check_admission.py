@@ -28,8 +28,12 @@ import glob
 import json
 import os
 import sys
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _load(path: str):
@@ -45,10 +49,16 @@ def main() -> int:
     ap_ = argparse.ArgumentParser(description=__doc__)
     ap_.add_argument("--interventions-k", type=int, default=50,
                      help="pool depth the do() trials were sampled at (default 50)")
+    ap_.add_argument("--release", action="store_true",
+                     help="enforce the complete 6-dataset x 2-model x 3-K matrix")
     args = ap_.parse_args()
 
     rows, problems = [], []
+    import config
     for d in sorted(glob.glob("results/beir-*")):
+        meta = _load(os.path.join(d, "run_meta.json")) or {}
+        if meta.get("experiment_version") != config.EXPERIMENT_VERSION:
+            continue
         ap = os.path.join(d, "admission_panel.parquet")
         if not os.path.exists(ap):
             continue
@@ -62,6 +72,14 @@ def main() -> int:
             "n": len(p),
             "admit": round(float(p["base_admitted"].mean()), 3),
         }
+        required = {"analysis_weight", "target_select_prob", "target_stratum",
+                    "competitive_spillover", "shapley_target", "shapley_competitors"}
+        missing = required - set(p.columns)
+        if missing:
+            problems.append(f"{name}: lexical panel missing v2 columns {sorted(missing)}")
+        elif not np.allclose(p["shapley_target"] + p["shapley_competitors"],
+                             p["surg_total"]):
+            problems.append(f"{name}: lexical Shapley reconstruction failed")
         ctl = p[(p["arm"] == "control") & p["base_admitted"]]
         tre = p[(p["arm"] == "treatment") & ~p["base_admitted"]]
         r["interference"] = round(float(ctl["surg_interference"].mean()), 3) if len(ctl) else None
@@ -79,6 +97,10 @@ def main() -> int:
             q = pd.read_parquet(dp)
             r["denseK"] = da.get("k_candidates")
             r["both_missed"] = int((q["u00"] == 0).sum()) if "u00" in q.columns else "no join"
+            if {"shapley_target", "shapley_competitors", "surg_total"} <= set(q.columns):
+                if not np.allclose(q["shapley_target"] + q["shapley_competitors"],
+                                   q["surg_total"]):
+                    problems.append(f"{name}: dense Shapley reconstruction failed")
             if not da.get("exact", False):
                 problems.append(f"{name}: dense audit not exact")
             if r["denseK"] is None:
@@ -93,22 +115,41 @@ def main() -> int:
             problems.append(f"{name}: lexical audit predates the K stamp - re-run stage 7")
         elif r["denseK"] is not None and r["lexK"] != r["denseK"]:
             problems.append(f"{name}: K mismatch lex={r['lexK']} dense={r['denseK']}")
-        if isinstance(r["both_missed"], int) and r["both_missed"]:
-            if r["lexK"] is not None and int(r["lexK"]) < args.interventions_k:
-                # Expected: the trials were sampled from a deeper pool, so some
-                # targets fall outside a shallower one. Report, do not fail.
-                r["both_missed"] = f"{r['both_missed']} (exp. K<{args.interventions_k})"
-            else:
-                problems.append(f"{name}: {r['both_missed']} rows outside BOTH channels "
-                                "(impossible - targets come from the union pool "
-                                f"at K={args.interventions_k})")
+        # v2 deliberately samples relevant targets outside the union. These are
+        # the extensive-margin population, not an impossible state.
         if r["immune_viol"]:
             problems.append(f"{name}: {r['immune_viol']} immunity-certificate violations")
+        if args.release and meta.get("git_dirty"):
+            problems.append(f"{name}: run was produced from a dirty worktree")
+        if meta.get("code") != config.code_fingerprint():
+            problems.append(f"{name}: code fingerprint differs from current source")
+        revision = meta.get("dense_model_revision")
+        if args.release and (not revision or revision == "main"):
+            problems.append(f"{name}: dense model is not pinned to an immutable revision")
+        ip = os.path.join(d, "interventions.parquet")
+        if os.path.exists(ip):
+            inter = pd.read_parquet(ip)
+            controls = inter[inter["arm"] == "control"]
+            if len(controls) and not (controls["delta_bm25"] == 0).all():
+                problems.append(f"{name}: controls changed the target BM25 score")
+            if not os.path.exists(os.path.join(d, "target_sampling_frame.parquet")):
+                problems.append(f"{name}: complete target sampling frame is missing")
+        for required_file in ("admission_estimates.csv", "union_gate.csv",
+                              "target_sampling_frame.parquet", "shard_completion.json"):
+            if args.release and not os.path.exists(os.path.join(d, required_file)):
+                problems.append(f"{name}: required release artefact {required_file} is missing")
         rows.append(r)
 
+    if args.release:
+        expected = 6 * 2 * 3
+        if len(rows) != expected:
+            problems.append(f"release matrix incomplete: found {len(rows)}/{expected} result arms")
+        for summary in ("results/meta_analysis.csv", "results/hypothesis_estimates.csv"):
+            if not os.path.exists(summary):
+                problems.append(f"release summary missing: {summary}")
     if not rows:
         print("no admission panels found under results/")
-        return 1
+        return 1 if args.release else 0
     print(pd.DataFrame(rows).to_string(index=False))
 
     print()

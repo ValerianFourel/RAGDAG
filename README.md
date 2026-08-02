@@ -1,13 +1,23 @@
 # RAGDAG
 
-*Causal retrieval MVP — treating a RAG retrieval pipeline as a DAG you can intervene on.*
+*Mechanistic retrieval experiment — competitive admission and masking in a
+sparse+dense retrieval subsystem.*
+
+> **Current scientific protocol:** experiment `admission-v2` is specified in
+> [`docs/publication-protocol.md`](docs/publication-protocol.md). The original
+> rank mediation, DoubleML, reranker-credit and rewrite-stability modules below
+> are retained as legacy exploratory work and are excluded from the archival
+> paper's claims.
 
 Can a retrieval pipeline be explained **causally**? When a document comes back,
 what caused it — the lexical stage, the dense stage, or the reranker?
 
-This is a self-contained research experiment on BEIR NFCorpus that treats a
-three-stage retrieval pipeline as a structural causal model and measures four
-things on it:
+The current experiment studies admission in BM25, two dense retrievers and
+their hybrid OR gate on six BEIR collections. It samples all mapped relevant
+documents, including documents outside the factual pool, and reports
+population-weighted rescue, displacement, competitive spillover and masking.
+
+The repository also retains the original NFCorpus MVP, which measured:
 
 1. **do()-interventions** on the query (term injection, with a matched control arm)
 2. **Exact path-specific effects** by freezing pipeline stages — computed, not estimated

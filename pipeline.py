@@ -420,7 +420,10 @@ class RetrievalPipeline:
             from sentence_transformers import SentenceTransformer
 
             self._log(f"loading dense model {config.DENSE_MODEL} on {config.DEVICE}")
-            self._dense_model = SentenceTransformer(config.DENSE_MODEL, device=config.DEVICE)
+            self._dense_model = SentenceTransformer(
+                config.DENSE_MODEL, device=config.DEVICE,
+                revision=config.DENSE_MODEL_REVISION,
+            )
             self._dense_model.max_seq_length = config.MAX_SEQ_LENGTH
             if config.USE_FP16 and config.ON_GPU:
                 self._dense_model.half()
@@ -467,8 +470,9 @@ class RetrievalPipeline:
             return
         self._log(f"embedding {len(self.corpus)} documents (one-off)")
         t0 = time.time()
+        prefix = str(config.DENSE_ADAPTER["document_prefix"])
         raw = self.dense_model.encode(
-            self.corpus.texts,
+            [prefix + text for text in self.corpus.texts],
             batch_size=config.EMBED_BATCH_SIZE,
             convert_to_numpy=True,
             normalize_embeddings=False,
@@ -522,7 +526,7 @@ class RetrievalPipeline:
         if hit is not None:
             return hit
         vec = self.dense_model.encode(
-            [config.BGE_QUERY_PREFIX + query],
+            [str(config.DENSE_ADAPTER["query_prefix"]) + query],
             convert_to_numpy=True,
             normalize_embeddings=True,
             show_progress_bar=False,
@@ -578,8 +582,11 @@ class RetrievalPipeline:
 
     def _topk_ids(self, arr: np.ndarray, k: int) -> list[str]:
         k = min(k, len(arr))
-        idx = np.argpartition(-arr, k - 1)[:k]
-        # Stable tie-break on (-score, doc index) keeps the pool deterministic.
+        cut = np.partition(arr, -k)[-k]
+        above = np.flatnonzero(arr > cut)
+        tied = np.flatnonzero(arr == cut)
+        idx = np.concatenate((above, tied[:k - len(above)]))
+        # Exact production tie-break on (-score, document index).
         idx = idx[np.lexsort((idx, -arr[idx]))]
         return [self.corpus.doc_ids[i] for i in idx]
 
@@ -718,14 +725,15 @@ class BaselineRun:
 
 
 def compute_baseline(
-    pipe: RetrievalPipeline, queries: Queries, qids: list[str]
+    pipe: RetrievalPipeline, queries: Queries, qids: list[str],
+    admission_only: bool = False,
 ) -> dict[str, BaselineRun]:
     """Run the un-intervened pipeline for every query and cache the result.
 
     Causal role: this is the factual world ``Q = q``. Every interventional and
     counterfactual quantity downstream is measured as a deviation from it.
     """
-    cache_key = config.baseline_cache_path(qids)
+    cache_key = config.baseline_cache_path(qids, admission_only)
     if cache_key.exists():
         with open(cache_key, "rb") as f:
             blob = pickle.load(f)
@@ -738,18 +746,27 @@ def compute_baseline(
     t0 = time.time()
     for n, qid in enumerate(qids, 1):
         qtext = queries.texts[qid]
-        res = pipe.run(qtext)
+        if admission_only:
+            bm = pipe._bm25_array(qtext)
+            de = pipe._dense_array(qtext)
+            candidates, provenance = pipe.candidates(bm, de)
+            reranked, ranks = [], {}
+        else:
+            res = pipe.run(qtext)
+            bm, de = res.bm25_full, res.dense_full
+            candidates, provenance = res.candidates, res.provenance
+            reranked, ranks = res.reranked, res.ranks
         runs[qid] = BaselineRun(
             query_id=qid,
             query_text=qtext,
-            candidates=res.candidates,
-            provenance=res.provenance,
-            reranked=res.reranked,
-            ranks=res.ranks,
+            candidates=candidates,
+            provenance=provenance,
+            reranked=reranked,
+            ranks=ranks,
             bm25_top=pipe.rank_bm25_only(qtext, config.K_CANDIDATES),
             dense_top=pipe.rank_dense_only(qtext, config.K_CANDIDATES),
-            bm25_scores_cand={d: float(res.bm25_full[pipe.corpus.idx(d)]) for d in res.candidates},
-            dense_scores_cand={d: float(res.dense_full[pipe.corpus.idx(d)]) for d in res.candidates},
+            bm25_scores_cand={d: float(bm[pipe.corpus.idx(d)]) for d in candidates},
+            dense_scores_cand={d: float(de[pipe.corpus.idx(d)]) for d in candidates},
         )
         if n % 25 == 0 or n == len(qids):
             el = time.time() - t0

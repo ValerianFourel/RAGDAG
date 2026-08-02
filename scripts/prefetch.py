@@ -7,7 +7,7 @@ single most common way a job dies four seconds after it starts.
 
 What it fetches / builds:
 
-* the dense encoder and cross-encoder checkpoints, into ``$HF_HOME``
+* the configured dense encoder checkpoint, into ``$HF_HOME``
 * the BEIR NFCorpus test collection, into ``$IR_DATASETS_HOME``
 * ``cache/corpus.pkl``   -- parsed documents, tokens, qrels (profile-independent)
 * ``cache/bm25_index/``  -- the BM25 index (profile-independent)
@@ -61,17 +61,15 @@ def main() -> int:
     t0 = time.time()
 
     # -- models -----------------------------------------------------------
-    from sentence_transformers import CrossEncoder, SentenceTransformer
+    from sentence_transformers import SentenceTransformer
 
     print(f"[1/4] dense encoder      {config.DENSE_MODEL}", flush=True)
     t = time.time()
-    m = SentenceTransformer(config.DENSE_MODEL, device="cpu")
+    m = SentenceTransformer(config.DENSE_MODEL, device="cpu",
+                            revision=config.DENSE_MODEL_REVISION)
     print(f"      ok ({time.time() - t:.1f}s, dim={m.get_sentence_embedding_dimension()})")
 
-    print(f"[2/4] cross-encoder      {config.CROSS_ENCODER_MODEL}", flush=True)
-    t = time.time()
-    CrossEncoder(config.CROSS_ENCODER_MODEL, device="cpu", max_length=config.CE_MAX_LENGTH)
-    print(f"      ok ({time.time() - t:.1f}s)")
+    print("[2/4] cross-encoder      skipped (admission-v2 is retrieval-only)")
 
     # -- dataset + derived caches -----------------------------------------
     print(f"[3/4] dataset            {config.DATASET}", flush=True)

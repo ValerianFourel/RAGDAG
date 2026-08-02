@@ -52,7 +52,7 @@ export TOKENIZERS_PARALLELISM=false
 TOTAL_CPUS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
 export N_TORCH_THREADS="${N_TORCH_THREADS:-$(( TOTAL_CPUS / N_GPUS > 0 ? TOTAL_CPUS / N_GPUS : 1 ))}"
 
-DS_TAG=$(${PY:-python} -c "import config; print(config.DATASET_TAG)" 2>/dev/null || echo default)
+DS_TAG=$(${PY:-python} -c "import config; print(config.RESULTS_DIR.name)" 2>/dev/null || echo default)
 mkdir -p logs "results/$DS_TAG/shards"
 
 echo "=== dataset: ${DATASET:-<config default>}  (results/$DS_TAG) ==="
@@ -72,6 +72,7 @@ p.bm25; p.doc_emb
 # read-only and identical for every worker. Built here so the 4 shards load it
 # instead of each spending minutes of allocated GPU time rebuilding it.
 interventions.build_vocab_stats(corpus)
+interventions.build_bm25_df(corpus)
 print('[warmup] corpus, BM25 index, embeddings and vocabulary tables are cached')
 " 2>&1 | tee "logs/${DS_TAG}_warmup.log"
 

@@ -34,7 +34,9 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import time
 from dataclasses import dataclass, field
 
@@ -52,6 +54,7 @@ STAGES = {
     7: "admission",
     8: "dense_admission",
 }
+PRIMARY_STAGES = (2, 7, 8)
 
 META_PATH = config.RESULTS_DIR / "run_meta.json"
 BASELINE_JSON = config.RESULTS_DIR / "baseline_ndcg.json"
@@ -85,6 +88,7 @@ def _fmt(s: float) -> str:
 def current_meta() -> dict:
     """Config fingerprint. A change here invalidates cached artefacts."""
     return {
+        "experiment_version": config.EXPERIMENT_VERSION,
         "dataset": config.DATASET,
         "n_queries": config.N_QUERIES,
         "k_candidates": config.K_CANDIDATES,
@@ -103,12 +107,42 @@ def current_meta() -> dict:
         "dense_max_length": config.MAX_SEQ_LENGTH,
         "precision": config.PRECISION_TAG,
         "dense_model": config.DENSE_MODEL,
+        "dense_model_revision": config.DENSE_MODEL_REVISION,
+        "dense_adapter": config.DENSE_ADAPTER,
         "ce_model": config.CROSS_ENCODER_MODEL,
         "seed": config.SEED,
         # Source fingerprint: a code change must invalidate cached artefacts,
         # otherwise a corrected sampler silently reports the old parquet.
         "code": config.code_fingerprint(),
+        "git_sha": _git("rev-parse", "HEAD"),
+        "git_dirty": bool(_git("status", "--porcelain")),
+        "dependency_lock_hash": _dependency_hash(),
     }
+
+
+def _git(*args: str) -> str:
+    try:
+        return subprocess.run(["git", *args], cwd=config.ROOT, check=True,
+                              capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _dependency_hash() -> str:
+    h = hashlib.sha256()
+    for name in ("requirements.txt", "requirements-gpu.txt"):
+        p = config.ROOT / name
+        h.update(name.encode())
+        h.update(p.read_bytes() if p.exists() else b"<missing>")
+    return h.hexdigest()[:16]
+
+
+def _file_sha256(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def meta_matches() -> bool:
@@ -147,8 +181,9 @@ def run_worker(shard: int, n_shards: int, stale: bool, only: set[int]) -> None:
 
     # -- 1. baseline (cached per query slice) --
     t0 = time.time()
-    baseline = P.compute_baseline(pipe, queries, qids)
-    if n_shards == 1:
+    admission_only = not bool(only & {3, 4, 5, 6})
+    baseline = P.compute_baseline(pipe, queries, qids, admission_only=admission_only)
+    if n_shards == 1 and 1 in only:
         ndcg = P.baseline_sanity_check(pipe, queries, baseline)
         with open(BASELINE_JSON, "w") as f:
             json.dump(ndcg, f, indent=2)
@@ -163,13 +198,16 @@ def run_worker(shard: int, n_shards: int, stale: bool, only: set[int]) -> None:
     import interventions as I
 
     p_inter = config.shard_path("interventions", shard, n_shards)
+    p_sampling = config.shard_path("target_sampling_frame", shard, n_shards)
     if 2 in only:
-        if p_inter.exists() and not stale:
+        if p_inter.exists() and p_sampling.exists() and not stale:
             print(f"[run_all{tag}] reusing {p_inter.name}")
         else:
             t0 = time.time()
             df = I.run_interventions(pipe, queries, baseline, qids)
             df.to_parquet(p_inter, index=False)
+            sampling = I.build_target_sampling_frame(pipe, queries, qids)
+            sampling.to_parquet(p_sampling, index=False)
             print(f"[run_all{tag}] wrote {p_inter.name} ({len(df)} rows)")
             clock.record("interventions", time.time() - t0)
 
@@ -272,15 +310,17 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
     pipe = P.RetrievalPipeline(corpus)
     all_qids = P.select_queries(queries)
 
-    # -- baseline: reassemble from the per-shard caches, no GPU work --
     baseline: dict[str, P.BaselineRun] = {}
-    for i in range(n_shards):
-        baseline.update(P.compute_baseline(pipe, queries, config.shard_queries(all_qids, i, n_shards)))
-    ndcg = P.baseline_sanity_check(pipe, queries, baseline)
-    with open(BASELINE_JSON, "w") as f:
-        json.dump(ndcg, f, indent=2)
-    if ndcg["full_pipeline"] < 0.15:
-        raise SystemExit("Full-pipeline nDCG@10 < 0.15 - the pipeline is broken.")
+    if only & {1, 3, 4, 5, 6}:
+        # Legacy rank/generation-adjacent modules require the CE baseline.
+        for i in range(n_shards):
+            baseline.update(P.compute_baseline(
+                pipe, queries, config.shard_queries(all_qids, i, n_shards)))
+        ndcg = P.baseline_sanity_check(pipe, queries, baseline)
+        with open(BASELINE_JSON, "w") as f:
+            json.dump(ndcg, f, indent=2)
+        if ndcg["full_pipeline"] < 0.15:
+            raise SystemExit("Full-pipeline nDCG@10 < 0.15 - the pipeline is broken.")
 
     import interventions as I
     import mediation as M
@@ -293,8 +333,29 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
         docs = I.origin_documents(corpus, inter["doc_id"].tolist())
         docs.to_parquet(I.OUT_ORIGIN_DOCS, index=False)
         print(f"[merge] wrote {I.OUT_ORIGIN_DOCS.name} ({len(docs)} origin documents)")
-        I.print_summary(inter)
-        I.plot_effects(inter)
+        sampling = _load_shards("target_sampling_frame", n_shards)
+        sampling.to_parquet(config.RESULTS_DIR / "target_sampling_frame.parquet", index=False)
+        completion = {
+            "n_shards": n_shards,
+            "intervention_shards": {
+                config.shard_path("interventions", i, n_shards).name:
+                _file_sha256(config.shard_path("interventions", i, n_shards))
+                for i in range(n_shards)
+            },
+            "sampling_frame_shards": {
+                config.shard_path("target_sampling_frame", i, n_shards).name:
+                _file_sha256(config.shard_path("target_sampling_frame", i, n_shards))
+                for i in range(n_shards)
+            },
+        }
+        (config.RESULTS_DIR / "shard_completion.json").write_text(
+            json.dumps(completion, indent=2))
+        if config.EXPERIMENT_VERSION != "admission-v2":
+            I.print_summary(inter)
+            I.plot_effects(inter)
+        else:
+            print("[merge] target strata:")
+            print(inter.groupby(["target_stratum", "arm"]).size().to_string())
 
     if 3 in only:
         med = _load_shards("mediation", n_shards)
@@ -350,26 +411,25 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
             inter = pd.read_parquet(A.config.RESULTS_DIR / "interventions.parquet")
             audit = A.audit_predictor(pipe, inter)
             A.OUT_AUDIT.write_text(json.dumps(audit, indent=2))
+            if not audit["exact"] or audit["admission_agreement"] != 1.0:
+                raise RuntimeError("BM25 score/admission replication audit failed")
             panel = A.build_admission_panel(pipe, inter)
             panel.to_parquet(A.OUT_PANEL, index=False)
-            tab = A.contrast_by_support(panel)
-            if not tab.empty:
-                tab.to_csv(config.RESULTS_DIR / "admission_by_support.csv", index=False)
-                print("\n[merge] admission retention by support:")
-                print(tab.to_string(index=False))
-            surg = A.surgical_by_support(panel)
-            if not surg.empty:
-                surg.to_csv(A.OUT_SURGICAL, index=False)
-                print("\n[merge] surgical same-word decomposition:")
-                print(surg.to_string(index=False))
-            res = A.fit_cate(panel)
-            if not res.empty:
-                res.to_csv(A.OUT_CATE, index=False)
-                print(res.to_string(index=False))
+            if config.EXPERIMENT_VERSION != "admission-v2":
+                tab = A.contrast_by_support(panel)
+                if not tab.empty:
+                    tab.to_csv(config.RESULTS_DIR / "admission_by_support.csv", index=False)
+                surg = A.surgical_by_support(panel)
+                if not surg.empty:
+                    surg.to_csv(A.OUT_SURGICAL, index=False)
+                res = A.fit_cate(panel)
+                if not res.empty:
+                    res.to_csv(A.OUT_CATE, index=False)
             clock.record("admission", time.time() - t0)
         except Exception as e:  # noqa: BLE001
             print(f"[merge] admission stage failed ({type(e).__name__}: {e}) - "
-                  "continuing; the rest of the run is unaffected.")
+                  "aborting the release run.")
+            raise
 
     # -- 8. dense admission: the same four worlds, no closed form --
     #
@@ -400,13 +460,17 @@ def run_merge(n_shards: int, stale: bool, only: set[int]) -> None:
                 ug.to_csv(DA.OUT_UNION, index=False)
                 print("\n[merge] union gate (BM25 OR dense):")
                 print(ug.to_string(index=False))
+            estimates = DA.publication_estimates(dpanel)
+            if not estimates.empty:
+                estimates.to_csv(DA.OUT_ESTIMATES, index=False)
             models = DA.mechanistic_models(dpanel)
             if not models.empty:
                 models.to_csv(DA.OUT_MODELS, index=False)
             clock.record("dense_admission", time.time() - t0)
         except Exception as e:  # noqa: BLE001
             print(f"[merge] dense admission stage failed ({type(e).__name__}: {e}) - "
-                  "continuing; the rest of the run is unaffected.")
+                  "aborting the release run.")
+            raise
 
     with open(META_PATH, "w") as f:
         json.dump(current_meta(), f, indent=2)
@@ -435,7 +499,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run the causal retrieval MVP end to end.")
     ap.add_argument("--force", action="store_true", help="ignore cached artefacts")
     ap.add_argument(
-        "--only", nargs="+", type=int, choices=sorted(STAGES), default=sorted(STAGES),
+        "--only", nargs="+", type=int, choices=sorted(STAGES), default=PRIMARY_STAGES,
         help="run only these stage numbers",
     )
     ap.add_argument("--shard", type=int, default=None, help="worker index (multi-GPU)")

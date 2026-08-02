@@ -73,7 +73,8 @@ uv pip install torch --index-url https://download.pytorch.org/whl/cu124
 uv pip install -r requirements-gpu.txt
 
 python - <<'PY'
-import importlib, sys
+import importlib.util
+import sys
 need = ["torch","transformers","sentence_transformers","numpy","pandas","scipy",
         "sklearn","doubleml","lightgbm","statsmodels","bm25s","Stemmer",
         "ir_datasets","matplotlib","pyarrow"]

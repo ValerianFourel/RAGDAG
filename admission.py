@@ -197,9 +197,22 @@ def boundary(scores: np.ndarray, k: int = config.K_CANDIDATES) -> dict[str, floa
     }
 
 
+def topk_indices(scores: np.ndarray, k: int = config.K_CANDIDATES) -> np.ndarray:
+    """Exactly K indices under production ``(-score, document index)`` order."""
+    k = min(k, len(scores))
+    cut = np.partition(scores, -k)[-k]
+    above = np.flatnonzero(scores > cut)
+    tied = np.flatnonzero(scores == cut)
+    chosen = np.concatenate((above, tied[:k - len(above)]))
+    return chosen[np.lexsort((chosen, -scores[chosen]))]
+
+
 def admitted(scores: np.ndarray, doc_idx: int, k: int = config.K_CANDIDATES) -> bool:
-    """Is this document in the top-K by these scores?"""
-    return bool(scores[doc_idx] >= np.partition(scores, -k)[-k])
+    """Production membership: exactly K docs with document-index tie-break."""
+    target = scores[doc_idx]
+    idx = np.arange(len(scores))
+    beats = int((scores > target).sum()) + int(((scores == target) & (idx < doc_idx)).sum())
+    return beats < min(k, len(scores))
 
 
 def predict_admission(base: np.ndarray, ids: np.ndarray, deltas: np.ndarray,
@@ -212,8 +225,8 @@ def predict_admission(base: np.ndarray, ids: np.ndarray, deltas: np.ndarray,
     """
     new = base.copy()
     new[ids] += deltas
-    top_old = set(np.argpartition(base, -k)[-k:].tolist())
-    top_new = set(np.argpartition(new, -k)[-k:].tolist())
+    top_old = set(topk_indices(base, k).tolist())
+    top_new = set(topk_indices(new, k).tolist())
     return {
         "pred_admitted": doc_idx in top_new,
         "pred_entrants": len(top_new - top_old),
@@ -253,8 +266,12 @@ class _WorldsGPU:
         st = self._cache.get(key)
         if st is None:
             t = self.torch.as_tensor(base, dtype=self.torch.float64, device=self.dev)
-            topv, topi = self.torch.topk(t, self.k)
-            st = (t, float(topv[-1].item()), set(topi.tolist()))
+            topv = self.torch.topk(t, self.k).values
+            cut = topv[-1]
+            above = self.torch.nonzero(t > cut).flatten()
+            tied = self.torch.nonzero(t == cut).flatten()
+            chosen = self.torch.cat((above, tied[:self.k - len(above)]))
+            st = (t, float(cut.item()), set(chosen.tolist()))
             self._cache[key] = st
             if len(self._cache) > 8:
                 self._cache.popitem(last=False)
@@ -267,16 +284,23 @@ class _WorldsGPU:
                  ) -> tuple[bool, bool, bool, bool, dict]:
         torch = self.torch
         base_t, kth0, top_old = self._query_state(qkey, base)
-        y00 = bool(base[di] >= kth0)
+        idx = torch.arange(len(base_t), device=self.dev)
+        def member(vals, target):
+            return bool((((vals > target) | ((vals == target) & (idx < di))).sum()
+                         < self.k).item())
+        y00 = member(base_t, base_t[di])
 
         ids_t = torch.as_tensor(ids, dtype=torch.long, device=self.dev)
         del_t = torch.as_tensor(deltas, dtype=torch.float64, device=self.dev)
         new = base_t.clone()
         new.index_put_((ids_t,), del_t, accumulate=True)
-        topv, topi = torch.topk(new, self.k)
+        topv = torch.topk(new, self.k).values
         s_new, kth11 = new[di], topv[-1]
-        y11 = bool((s_new >= kth11).item())
-        top_new = set(topi.tolist())
+        y11 = member(new, s_new)
+        above = torch.nonzero(new > kth11).flatten()
+        tied = torch.nonzero(new == kth11).flatten()
+        chosen = torch.cat((above, tied[:self.k - len(above)]))
+        top_new = set(chosen.tolist())
         pred = {
             "pred_admitted": y11,
             "pred_entrants": len(top_new - top_old),
@@ -288,11 +312,11 @@ class _WorldsGPU:
         if d_target:
             new[di] -= d_target                       # competitors only
             kth01 = torch.topk(new, self.k).values[-1]
-            y01 = bool((new[di] >= kth01).item())
+            y01 = member(new, new[di])
             v = base_t.clone()                        # target only
             v[di] += d_target
             kth10 = torch.topk(v, self.k).values[-1]
-            y10 = bool((v[di] >= kth10).item())
+            y10 = member(v, v[di])
         else:
             # control: the target's delta is exactly 0, so the mixed worlds
             # coincide with the pure ones - no extra kernels needed.
@@ -339,7 +363,8 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
     for n, r in enumerate(inter.itertuples(), 1):
         q0, term = r.query_text, r.term
         if q0 not in base_cache:
-            base_cache[q0] = np.asarray(pipe.bm25.get_scores(sorted(bm25_terms(q0))))
+            # Preserve repeated query stems exactly as the production scorer does.
+            base_cache[q0] = np.asarray(pipe._bm25_array(q0), dtype=np.float64)
         base = base_cache[q0]
         try:
             di = corpus.idx(r.doc_id)
@@ -398,6 +423,13 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
         rows.append({
             "query_id": r.query_id, "doc_id": r.doc_id, "term": term, "arm": r.arm,
             "select_prob": float(getattr(r, "select_prob", np.nan)),
+            "analysis_weight": float(getattr(r, "analysis_weight", 1.0)),
+            "target_select_prob": float(getattr(r, "target_select_prob", 1.0)),
+            "target_stratum": str(getattr(r, "target_stratum", "legacy_in_pool")),
+            "target_population_n": int(getattr(r, "target_population_n", 0)),
+            "bm25_rank_corpus": int(getattr(r, "bm25_rank_corpus", 0)),
+            "dense_rank_corpus": int(getattr(r, "dense_rank_corpus", 0)),
+            "hybrid_rank_margin": float(getattr(r, "hybrid_rank_margin", np.nan)),
             # --- treatment coordinates -------------------------------------
             "support": float(support),
             "lift": float(lift),
@@ -413,9 +445,14 @@ def build_admission_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
             # --- surgical worlds: channels switched separately --------------
             "y00": bool(y00), "y10": bool(y10), "y01": bool(y01), "y11": bool(y11),
             "surg_direct": int(y10) - int(y00),
-            "surg_interference": int(y01) - int(y00),
+            "surg_interference": int(y01) - int(y00),  # legacy alias
+            "competitive_spillover": int(y01) - int(y00),
             "surg_total": int(y11) - int(y00),
             "surg_interaction": int(y11) - int(y10) - int(y01) + int(y00),
+            "shapley_target": 0.5 * ((int(y10) - int(y00)) +
+                                     (int(y11) - int(y01))),
+            "shapley_competitors": 0.5 * ((int(y01) - int(y00)) +
+                                          (int(y11) - int(y10))),
             "threat_count": threat,
         })
         if n % 500 == 0:
@@ -448,8 +485,8 @@ def audit_predictor(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) 
         bt = sorted(bm25_terms(r.term))
         if len(bt) != 1 or bt[0] in bm25_terms(r.query_text):
             continue
-        base = np.asarray(pipe.bm25.get_scores(sorted(bm25_terms(r.query_text))))
-        truth = np.asarray(pipe.bm25.get_scores(sorted(bm25_terms(r.injected_query))))
+        base = np.asarray(pipe._bm25_array(r.query_text), dtype=np.float64)
+        truth = np.asarray(pipe._bm25_array(r.injected_query), dtype=np.float64)
         ids, deltas = bm25_delta(bt[0], post, dl, avgdl, n_docs)
         pred = base.copy()
         pred[ids] += deltas

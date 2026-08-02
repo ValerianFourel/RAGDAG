@@ -209,8 +209,9 @@ def sample_treatment_terms(
     rng: np.random.Generator,
     n: int = config.N_TREATMENT_TERMS,
     query_bm25: frozenset[str] = frozenset(),
+    bm25_df: dict[str, int] | None = None,
 ) -> list[dict]:
-    """Sample ``n`` terms from the target document, stratified by **support**.
+    """Sample at most one target term from each prespecified support band.
 
     Two-stage draw:
 
@@ -252,38 +253,31 @@ def sample_treatment_terms(
     if not cands:
         return []
 
-    by_bin: dict[int, list[str]] = {}
-    for t in cands:
-        by_bin.setdefault(vs.bin_of(t), []).append(t)
+    def indexed_support(term: str) -> float:
+        bt = bm25_terms(term)
+        return ((bm25_df or {}).get(next(iter(bt)), 0) / vs.n_docs
+                if len(bt) == 1 and bm25_df is not None else vs.support(term))
 
+    bands = (("rare", 0.0, 0.01), ("medium", 0.01, 0.10),
+             ("common", 0.10, 1.01))
     out: list[dict] = []
-    available = sorted(by_bin)
-    for _ in range(min(n, len(cands))):
-        if not available:
-            available = sorted(by_bin)
-            if not available:
-                break
-        b = int(available[rng.integers(len(available))])
-        available.remove(b)
-        pool = by_bin[b]
-        w = np.array([max(vs.lift(t, tf_all[t], dl), 1e-12) for t in pool], dtype=np.float64)
-        p = w / w.sum()
-        j = int(rng.choice(len(pool), p=p))
-        term = pool[j]
-        # P(bin) * P(term | bin); n_bins_available is the count at draw time.
+    for band, lo, hi in bands[:n]:
+        pool = [t for t in cands if len(bm25_terms(t)) == 1
+                and lo <= indexed_support(t) < hi]
+        if not pool:
+            continue
+        term = pool[int(rng.integers(len(pool)))]
+        b = vs.bin_of(term)
         out.append({
             "term": term,
             "support_bin": b,
-            "select_prob": float((1.0 / max(1, len(by_bin))) * p[j]),
+            "support_band": band,
+            "term_bm25_df": int(round(indexed_support(term) * vs.n_docs)),
+            "select_prob": float(1.0 / len(pool)),
             "term_lift": float(vs.lift(term, tf_all[term], dl)),
             "n_candidate_terms": len(cands),
-            "n_candidate_bins": len(by_bin),
+            "n_candidate_bins": 3,
         })
-        pool.remove(term)
-        if not pool:
-            by_bin.pop(b, None)
-        if not by_bin:
-            break
     return out
 
 
@@ -330,6 +324,26 @@ def bm25_terms(text: str) -> frozenset[str]:
     return out
 
 
+def build_bm25_df(corpus: Corpus) -> dict[str, int]:
+    """Document frequencies in the index tokenizer's exact term space."""
+    if config.BM25_DF_CACHE.exists():
+        try:
+            with open(config.BM25_DF_CACHE, "rb") as f:
+                cached = pickle.load(f)
+            if cached.get("n_docs") == len(corpus):
+                return {str(t): int(v) for t, v in cached["df"].items()}
+        except Exception:  # noqa: BLE001
+            pass
+    counts: Counter = Counter()
+    for text in corpus.texts:
+        counts.update(bm25_terms(text))
+    tmp = config.BM25_DF_CACHE.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump({"n_docs": len(corpus), "df": dict(counts)}, f)
+    tmp.replace(config.BM25_DF_CACHE)
+    return dict(counts)
+
+
 def sample_control_terms(
     doc_tokens: frozenset[str],
     query_tokens: set[str],
@@ -339,6 +353,8 @@ def sample_control_terms(
     n: int = config.N_CONTROL_TERMS,
     doc_bm25: frozenset[str] = frozenset(),
     query_bm25: frozenset[str] = frozenset(),
+    match_df: list[int] | None = None,
+    bm25_df: dict[str, int] | None = None,
 ) -> list[dict]:
     """Sample corpus terms that cannot touch the document's BM25 score,
     **matched to the treatment arm on support bin**.
@@ -369,6 +385,39 @@ def sample_control_terms(
     target document's BM25 score, which is the invariant the whole
     treatment-versus-control contrast rests on.
     """
+    if match_df is not None:
+        forbidden = doc_bm25 | query_bm25
+        available = [t for t in vs.control_pool
+                     if t not in doc_tokens and t not in query_tokens
+                     and not (bm25_terms(t) & forbidden)]
+        out = []
+        taken: set[str] = set()
+        for pair_slot, wanted in enumerate(match_df):
+            def indexed_df(t):
+                bt = bm25_terms(t)
+                return (bm25_df or {}).get(next(iter(bt)), 0) if len(bt) == 1 else 0
+            candidates = [t for t in available if t not in taken and wanted > 0
+                          and indexed_df(t) > 0
+                          and abs(np.log(indexed_df(t)) - np.log(wanted)) <= 0.1]
+            if not candidates:
+                continue
+            distances = np.array([abs(np.log(indexed_df(t)) - np.log(wanted))
+                                  for t in candidates])
+            best = np.flatnonzero(distances == distances.min())
+            term = candidates[int(best[int(rng.integers(len(best)))])]
+            taken.add(term)
+            out.append({
+                "term": term, "support_bin": vs.bin_of(term),
+                "pair_slot": pair_slot,
+                "support_bin_requested": vs.bin_of(term),
+                "control_bin_matched": True,
+                "df_match_target": int(wanted),
+                "term_bm25_df": int(indexed_df(term)),
+                "df_match_log_distance": float(abs(np.log(indexed_df(term)) - np.log(wanted))),
+                "select_prob": float(1.0 / len(best)), "term_lift": 0.0,
+                "n_candidate_terms": len(candidates), "n_candidate_bins": 3,
+            })
+        return out
     if match_bins is None:
         match_bins = [int(rng.integers(vs.n_bins)) for _ in range(n)]
     forbidden = doc_bm25 | query_bm25
@@ -459,6 +508,7 @@ def term_provenance(
         "term_source": "target_document" if arm == "treatment" else "corpus_vocabulary",
         "term_tf_in_doc": int(tf_all.get(term, 0)),
         "term_df_corpus": int(df),
+        "term_bm25_df_corpus": int(draw.get("term_bm25_df", df)),
         "term_cf_corpus": int(vs.cf.get(term, 0)),
         # Kept under the historical name (it holds a *fraction*, not a percent)
         # so old analyses keep working; term_support is the correctly-named one.
@@ -469,7 +519,10 @@ def term_provenance(
         "support_bin_lo": lo,
         "support_bin_hi": hi,
         "support_bin_requested": int(draw.get("support_bin_requested", b)),
+        "support_band": str(draw.get("support_band", "matched_control")),
         "control_bin_matched": bool(draw.get("control_bin_matched", True)),
+        "df_match_target": int(draw.get("df_match_target", draw.get("term_bm25_df", 0))),
+        "df_match_log_distance": float(draw.get("df_match_log_distance", 0.0)),
         "term_idf": float(vs.idf(term)),
         "term_tfidf_weight": float(tf_all.get(term, 0) * vs.idf(term)),
         "term_in_title": bool(term in set(content_tokens(corpus.titles[i]))),
@@ -511,11 +564,9 @@ def origin_documents(corpus: Corpus, doc_ids: list[str], snippet_chars: int = 40
 # --------------------------------------------------------------------------- #
 # Target selection
 # --------------------------------------------------------------------------- #
-def select_targets(
-    run: BaselineRun, relevant: set[str], rng: np.random.Generator
-) -> list[str]:
-    """Judged-relevant documents in the baseline *candidate pool*, capped at
-    :data:`config.MAX_TARGET_DOCS_PER_QUERY`.
+def select_targets(pipe: RetrievalPipeline, query: str, relevant: set[str],
+                   rng: np.random.Generator, return_frame: bool = False) -> list[dict]:
+    """Population-aware sample from every mapped judged-relevant document.
 
     Eligibility is membership of the pool, not of the reranked top-K. Requiring
     a non-censored baseline rank would restrict targets to documents the
@@ -527,13 +578,62 @@ def select_targets(
     The sample is drawn with a per-query RNG rather than taking the best-ranked
     documents, which would leave no headroom for a positive effect.
     """
-    eligible = sorted(set(run.candidates) & relevant)
+    eligible = sorted(d for d in relevant if d in pipe.corpus.doc_index)
+    if not eligible:
+        return []
+    bm = pipe._bm25_array(query)
+    de = pipe._dense_array(query)
+    idx = np.arange(len(pipe.corpus))
+
+    def rank(arr: np.ndarray, di: int) -> int:
+        return 1 + int((arr > arr[di]).sum()) + int(((arr == arr[di]) & (idx < di)).sum())
+
+    records = []
+    for doc_id in eligible:
+        di = pipe.corpus.idx(doc_id)
+        rb, rd = rank(bm, di), rank(de, di)
+        h = config.K_CANDIDATES - min(rb, rd)
+        if h >= 10:
+            stratum = "deep_in"
+        elif h >= 0:
+            stratum = "boundary_in"
+        elif h >= -10:
+            stratum = "boundary_out"
+        elif h >= -50:
+            stratum = "mid_out"
+        else:
+            stratum = "deep_out"
+        records.append({"doc_id": doc_id, "bm25_rank_corpus": rb,
+                        "dense_rank_corpus": rd, "hybrid_rank_margin": h,
+                        "target_stratum": stratum})
     if len(eligible) <= config.MAX_TARGET_DOCS_PER_QUERY:
-        return eligible
-    idx = rng.choice(
-        len(eligible), size=config.MAX_TARGET_DOCS_PER_QUERY, replace=False
-    )
-    return [eligible[j] for j in sorted(idx)]
+        return [{**r, "target_selected": True, "target_select_prob": 1.0,
+                 "target_population_n": len(eligible)} for r in records]
+    framed = []
+    for stratum in ("deep_in", "boundary_in", "boundary_out", "mid_out", "deep_out"):
+        pool = [r for r in records if r["target_stratum"] == stratum]
+        if not pool:
+            continue
+        take = min(2, len(pool))
+        chosen = rng.choice(len(pool), size=take, replace=False)
+        chosen_set = {int(j) for j in chosen}
+        framed.extend({**r, "target_selected": j in chosen_set,
+                       "target_select_prob": take / len(pool),
+                       "target_population_n": len(eligible)}
+                      for j, r in enumerate(pool))
+    return framed if return_frame else [r for r in framed if r["target_selected"]]
+
+
+def build_target_sampling_frame(pipe: RetrievalPipeline, queries: Queries,
+                                qids: list[str]) -> pd.DataFrame:
+    """Complete qrel target population and its realized stratified sample."""
+    rows = []
+    for qid in qids:
+        rng = np.random.default_rng(config.stable_seed(qid))
+        for r in select_targets(pipe, queries.texts[qid], queries.relevant(qid), rng,
+                                return_frame=True):
+            rows.append({"query_id": qid, **r})
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -548,6 +648,7 @@ def run_interventions(
     """Apply every do(Q -> Q + t) and record the induced change in the outcome."""
     corpus = pipe.corpus
     vs = build_vocab_stats(corpus)
+    indexed_df = build_bm25_df(corpus)
     print(f"[interventions] vocab: {len(vs.df)} terms, control pool {len(vs.control_pool)}")
 
     rows: list[dict] = []
@@ -562,13 +663,17 @@ def run_interventions(
         # identical whether this query is processed by a single-process run or
         # by one worker of a sharded multi-GPU run.
         rng = np.random.default_rng(config.stable_seed(qid))
-        targets = select_targets(run, rel, rng)
+        targets = select_targets(pipe, q0, rel, rng)
+        bm25_full0 = pipe._bm25_array(q0)
+        dense_full0 = pipe._dense_array(q0)
 
-        for doc_id in targets:
+        for target in targets:
+            doc_id = target["doc_id"]
             base_rank = run.ranks.get(doc_id, config.MISSING_RANK)
             base_ce = dict(run.reranked).get(doc_id, float("nan"))
-            base_bm25 = run.bm25_scores_cand.get(doc_id, 0.0)
-            base_dense = run.dense_scores_cand.get(doc_id, 0.0)
+            di = corpus.idx(doc_id)
+            base_bm25 = float(bm25_full0[di])
+            base_dense = float(dense_full0[di])
             cov = pipe.covariates(q0, doc_id)
             prov = run.provenance.get(doc_id, "none")
 
@@ -578,24 +683,39 @@ def run_interventions(
             # must be matched to, so the two arms differ only in whether the
             # term came from the document.
             treat = sample_treatment_terms(
-                corpus, doc_id, qtok, vs, rng, query_bm25=qbm25
+                corpus, doc_id, qtok, vs, rng, query_bm25=qbm25,
+                bm25_df=indexed_df,
             )
+            for pair_slot, draw in enumerate(treat):
+                draw["pair_slot"] = pair_slot
+            controls = sample_control_terms(
+                dtok, qtok, vs, rng,
+                match_bins=[d["support_bin"] for d in treat],
+                doc_bm25=dbm25, query_bm25=qbm25,
+                match_df=[indexed_df[next(iter(bm25_terms(d["term"])))] for d in treat],
+                bm25_df=indexed_df,
+            )
+            matched_slots = {d["pair_slot"] for d in controls}
+            for draw in treat:
+                draw["control_match_status"] = (
+                    "matched" if draw["pair_slot"] in matched_slots
+                    else "no_control_within_log_df_caliper"
+                )
+            for draw in controls:
+                draw["control_match_status"] = "matched"
             arms = {
                 "treatment": treat,
-                "control": sample_control_terms(
-                    dtok, qtok, vs, rng,
-                    match_bins=[d["support_bin"] for d in treat],
-                    doc_bm25=dbm25, query_bm25=qbm25,
-                ),
+                "control": controls,
             }
             for arm, draws in arms.items():
                 for draw in draws:
                     term = draw["term"]
                     q1 = f"{q0} {term}"
-                    res = pipe.run(q1)
-                    new_rank = res.rank_of(doc_id)
-                    di = corpus.idx(doc_id)
-                    new_ce = res.ce_score_of(doc_id)
+                    bm25_new = pipe._bm25_array(q1)
+                    dense_new = pipe._dense_array(q1)
+                    candidates_new, provenance_new = pipe.candidates(bm25_new, dense_new)
+                    new_rank = config.MISSING_RANK
+                    new_ce = None
                     prov_term = term_provenance(corpus, doc_id, draw, vs, arm)
                     rows.append(
                         {
@@ -603,6 +723,10 @@ def run_interventions(
                             "doc_id": doc_id,
                             "term": term,
                             "arm": arm,
+                            "pair_slot": int(draw.get("pair_slot", -1)),
+                            "control_match_status": str(draw.get("control_match_status", "legacy")),
+                            **target,
+                            "analysis_weight": 1.0 / target["target_select_prob"],
                             **prov_term,
                             "query_text": q0,
                             "injected_query": q1,
@@ -619,14 +743,14 @@ def run_interventions(
                             if new_ce is not None
                             else float("nan"),
                             "base_bm25": base_bm25,
-                            "new_bm25": float(res.bm25_full[di]),
-                            "delta_bm25": float(res.bm25_full[di]) - base_bm25,
+                            "new_bm25": float(bm25_new[di]),
+                            "delta_bm25": float(bm25_new[di]) - base_bm25,
                             "base_dense": base_dense,
-                            "new_dense": float(res.dense_full[di]),
-                            "delta_dense": float(res.dense_full[di]) - base_dense,
-                            "in_candidates": doc_id in res.provenance,
+                            "new_dense": float(dense_new[di]),
+                            "delta_dense": float(dense_new[di]) - base_dense,
+                            "in_candidates": doc_id in provenance_new,
                             "provenance_base": prov,
-                            "provenance_new": res.provenance.get(doc_id, "none"),
+                            "provenance_new": provenance_new.get(doc_id, "none"),
                             **cov,
                         }
                     )

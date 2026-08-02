@@ -28,14 +28,14 @@
 #SBATCH --partition=accelerated
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=01:30:00
 #SBATCH --output=logs/ragdag-adm-%j.out
 #SBATCH --error=logs/ragdag-adm-%j.out
 
-set -uo pipefail
+set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 mkdir -p logs
 
@@ -47,15 +47,6 @@ export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
 source .venv/bin/activate
-
-if [ -z "${K_CANDIDATES:-}" ]; then
-  echo "refusing to run: K_CANDIDATES must be set explicitly (it is"
-  echo "partition-dependent by default, which is how a CPU job once wrote"
-  echo "K=20 panels over K=50 ones)." >&2
-  exit 2
-fi
-export K_CANDIDATES
-export RESULTS_SUFFIX="${RESULTS_SUFFIX:-}"
 
 # NOT named DATASETS: HoreKa exports DATASETS=/hkfs/home/dataset/datasets
 # system-wide, and --export=ALL inherits it, so a ${DATASETS:-default} would
@@ -72,7 +63,7 @@ for _ds in $RAGDAG_DATASETS; do
 done
 
 echo "=================================================================="
-echo "RAGDAG admission  K=$K_CANDIDATES  suffix='${RESULTS_SUFFIX}'"
+echo "RAGDAG admission-v2 publication experiment"
 echo "  node        $(hostname)"
 echo "  started     $(date)"
 echo "  datasets    $RAGDAG_DATASETS"
@@ -80,33 +71,43 @@ echo "=================================================================="
 
 python scripts/test_worlds.py || { echo "unit tests failed - aborting"; exit 1; }
 
-# A suffixed run starts from an empty directory, so seed it with the intervention
-# log from the primary run. The sampled do() operations are deliberately held
-# fixed across K: only the bar changes, which is the whole point of the sweep.
-if [ -n "$RESULTS_SUFFIX" ]; then
+RAGDAG_MODELS="${RAGDAG_MODELS:-BAAI/bge-small-en-v1.5 intfloat/e5-small-v2}"
+for model in $RAGDAG_MODELS; do
+  model_tag="${model##*/}"
+  case "$model" in
+    BAAI/bge-small-en-v1.5) revision="${BGE_REVISION:-}" ;;
+    intfloat/e5-small-v2) revision="${E5_REVISION:-}" ;;
+    *) echo "unsupported publication model: $model" >&2; exit 2 ;;
+  esac
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "set BGE_REVISION and E5_REVISION to immutable 40-character HF commits" >&2
+    exit 2
+  }
   for ds in $RAGDAG_DATASETS; do
-    tag="${ds//\//-}"
-    src="results/${tag}/interventions.parquet"
-    dst="results/${tag}${RESULTS_SUFFIX}"
-    if [ -f "$src" ]; then
-      mkdir -p "$dst"
-      cp -n "$src" "$dst/" && echo "seeded $dst/interventions.parquet"
-    else
-      echo "!! no $src - $ds will be skipped"
-    fi
-  done
-fi
+    echo ""
+    echo "# PRIMARY dataset=$ds model=$model K=50 $(date +%H:%M:%S)"
+    DATASET="$ds" DENSE_MODEL="$model" DENSE_MODEL_REVISION="$revision" K_CANDIDATES=50 \
+      ./scripts/run_multigpu.sh 4 --only 2 7 8 --force
 
-failed=""
-for ds in $RAGDAG_DATASETS; do
-  echo ""
-  echo "# dataset: $ds   $(date +%H:%M:%S)"
-  DATASET="$ds" python -m run_all --merge --n-shards 4 --only 7 8 \
-    || { echo "!! FAILED: $ds"; failed="$failed $ds"; }
+    # Hold the sampled trials fixed in the K arms; only the admission bar moves.
+    src_dir="$(DATASET="$ds" DENSE_MODEL="$model" DENSE_MODEL_REVISION="$revision" K_CANDIDATES=50 python -c 'import config; print(config.RESULTS_DIR)')"
+    src="$src_dir/interventions.parquet"
+    for k in 20 100; do
+      dst="$(DATASET="$ds" DENSE_MODEL="$model" DENSE_MODEL_REVISION="$revision" K_CANDIDATES="$k" python -c 'import config; print(config.RESULTS_DIR)')"
+      mkdir -p "$dst"
+      cp "$src" "$dst/interventions.parquet"
+      cp "$src_dir/target_sampling_frame.parquet" "$dst/"
+      cp "$src_dir/origin_documents.parquet" "$dst/"
+      cp "$src_dir/shard_completion.json" "$dst/"
+      echo "# SENSITIVITY dataset=$ds model=$model K=$k $(date +%H:%M:%S)"
+      DATASET="$ds" DENSE_MODEL="$model" DENSE_MODEL_REVISION="$revision" K_CANDIDATES="$k" \
+        python -m run_all --merge --n-shards 4 --only 7 8 --force
+    done
+  done
 done
 
 echo ""
 echo "------------------------------------------------------------------"
 echo "finished     $(date)"
-[ -n "$failed" ] && echo "!! datasets that failed:$failed"
-exit 0
+python scripts/meta_analyze.py
+python scripts/check_admission.py --release

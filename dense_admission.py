@@ -56,6 +56,7 @@ OUT_AUDIT = config.RESULTS_DIR / "dense_admission_audit.json"
 OUT_BY_BIN = config.RESULTS_DIR / "dense_admission_by_bin.csv"
 OUT_MODELS = config.RESULTS_DIR / "dense_admission_models.csv"
 OUT_UNION = config.RESULTS_DIR / "union_gate.csv"
+OUT_ESTIMATES = config.RESULTS_DIR / "admission_estimates.csv"
 
 #: query-embedding cache - keyed on the exact text, tagged with everything that
 #: changes the vector (model, sequence length, precision).
@@ -145,6 +146,14 @@ class DenseRef:
     def scores(self, e):
         return self.E @ e
 
+    def topk_set(self, scores, k: int) -> set[int]:
+        """Production tie-break: score descending, then document index."""
+        cut = self.torch.topk(scores, k).values[-1]
+        above = self.torch.nonzero(scores > cut).flatten()
+        tied = self.torch.nonzero(scores == cut).flatten()
+        chosen = self.torch.cat((above, tied[:k - len(above)]))
+        return set(chosen.tolist())
+
     def query_state(self, qtext: str, e0: np.ndarray, k: int) -> tuple:
         """(base scores, K-th value, e0 tensor), cached per query text."""
         st = self._q.get(qtext)
@@ -177,7 +186,7 @@ def encode_unique(pipe: RetrievalPipeline, texts: list[str]) -> dict[str, np.nda
     if todo:
         t0 = time.time()
         vecs = pipe.dense_model.encode(
-            [config.BGE_QUERY_PREFIX + t for t in todo],
+            [str(config.DENSE_ADAPTER["query_prefix"]) + t for t in todo],
             batch_size=config.EMBED_BATCH_SIZE,
             convert_to_numpy=True,
             normalize_embeddings=True,
@@ -218,7 +227,8 @@ def audit_dense(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) -> d
 
     # batch-vs-single encoding drift, on a small deterministic sample
     single = pipe.dense_model.encode(
-        [config.BGE_QUERY_PREFIX + t for t in sorted(set(texts))[:16]],
+        [str(config.DENSE_ADAPTER["query_prefix"]) + t
+         for t in sorted(set(texts))[:16]],
         batch_size=1, convert_to_numpy=True, normalize_embeddings=True,
         show_progress_bar=False,
     ).astype(np.float32)
@@ -248,8 +258,8 @@ def audit_dense(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) -> d
         # production fp32 path vs fp64 reference, on the injected query
         prod = pipe._dense_array(r.injected_query)  # noqa: SLF001 - the audited path
         prod_t = torch.as_tensor(prod, dtype=torch.float64, device=ref.dev)
-        ref_top = set(torch.topk(truth, k).indices.tolist())
-        prod_top = set(torch.topk(prod_t, k).indices.tolist())
+        ref_top = ref.topk_set(truth, k)
+        prod_top = ref.topk_set(prod_t, k)
         topk_exact += int(ref_top == prod_top)
         jac_sum += len(ref_top & prod_top) / len(ref_top | prod_top)
         try:
@@ -349,6 +359,10 @@ def build_dense_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
         rows.append({
             "query_id": r.query_id, "doc_id": r.doc_id, "term": r.term, "arm": r.arm,
             "select_prob": float(getattr(r, "select_prob", np.nan)),
+            "analysis_weight": float(getattr(r, "analysis_weight", 1.0)),
+            "target_select_prob": float(getattr(r, "target_select_prob", 1.0)),
+            "target_stratum": str(getattr(r, "target_stratum", "legacy_in_pool")),
+            "target_population_n": int(getattr(r, "target_population_n", 0)),
             # --- coordinates -------------------------------------------------
             "target_delta": d_t,
             "query_delta_norm": dqn,
@@ -384,10 +398,15 @@ def build_dense_panel(pipe: RetrievalPipeline, inter: pd.DataFrame,
             "y00": bool(w["y00"]), "y10": bool(w["y10"]),
             "y01": bool(w["y01"]), "y11": bool(w["y11"]),
             "surg_direct": int(w["y10"]) - int(w["y00"]),
-            "surg_interference": int(w["y01"]) - int(w["y00"]),
+            "surg_interference": int(w["y01"]) - int(w["y00"]),  # legacy alias
+            "competitive_spillover": int(w["y01"]) - int(w["y00"]),
             "surg_total": int(w["y11"]) - int(w["y00"]),
             "surg_interaction": (int(w["y11"]) - int(w["y10"])
                                  - int(w["y01"]) + int(w["y00"])),
+            "shapley_target": 0.5 * ((int(w["y10"]) - int(w["y00"])) +
+                                     (int(w["y11"]) - int(w["y01"]))),
+            "shapley_competitors": 0.5 * ((int(w["y01"]) - int(w["y00"])) +
+                                          (int(w["y11"]) - int(w["y10"]))),
         })
         if n % 1000 == 0:
             print(f"[dense_admission] {n}/{len(inter)} rows, "
@@ -433,10 +452,14 @@ def join_lexical(panel: pd.DataFrame) -> pd.DataFrame:
         return panel
     lex = pd.read_parquet(A.OUT_PANEL)
     cols = ["query_id", "doc_id", "term", "arm", "support", "lift", "idf",
-            "base_margin", "y00", "y10", "y01", "y11", "threat_count"]
+            "base_margin", "y00", "y10", "y01", "y11", "threat_count",
+            "competitive_spillover", "shapley_target", "shapley_competitors"]
     lex = lex[[c for c in cols if c in lex.columns]].rename(columns={
         "base_margin": "bm25_margin", "threat_count": "bm25_threat_count",
         "y00": "bm25_y00", "y10": "bm25_y10", "y01": "bm25_y01", "y11": "bm25_y11",
+        "competitive_spillover": "bm25_competitive_spillover",
+        "shapley_target": "bm25_shapley_target",
+        "shapley_competitors": "bm25_shapley_competitors",
     })
     merged = panel.merge(lex, on=["query_id", "doc_id", "term", "arm"], how="left")
     if len(merged) != len(panel):
@@ -475,6 +498,125 @@ def union_gate(panel: pd.DataFrame) -> pd.DataFrame:
             "union_rescue": int(((g["u00"] == 0) & (g["u11"] == 1)).sum()),
             "union_displacement": int(((g["u00"] == 1) & (g["u11"] == 0)).sum()),
         })
+    return pd.DataFrame(recs)
+
+
+def _weighted_mean(g: pd.DataFrame, column: str) -> float:
+    v = g[column].to_numpy(dtype=float)
+    w = g.get("analysis_weight", pd.Series(1.0, index=g.index)).to_numpy(dtype=float)
+    ok = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    return float(np.average(v[ok], weights=w[ok])) if ok.any() else float("nan")
+
+
+def _weighted_cluster_boot(g: pd.DataFrame, column: str, rng,
+                           n_boot: int) -> np.ndarray:
+    """Fast query-cluster bootstrap of an inverse-probability weighted mean."""
+    stats = []
+    for _, q in g.groupby("query_id", sort=True):
+        v = q[column].to_numpy(dtype=float)
+        w = q.get("analysis_weight", pd.Series(1.0, index=q.index)).to_numpy(dtype=float)
+        ok = np.isfinite(v) & np.isfinite(w) & (w > 0)
+        stats.append((float((v[ok] * w[ok]).sum()), float(w[ok].sum())))
+    a = np.asarray(stats, dtype=float)
+    if not len(a):
+        return np.full(n_boot, np.nan)
+    draw = rng.integers(0, len(a), size=(n_boot, len(a)))
+    num = a[draw, 0].sum(axis=1)
+    den = a[draw, 1].sum(axis=1)
+    return np.divide(num, den, out=np.full(n_boot, np.nan), where=den > 0)
+
+
+def publication_estimates(panel: pd.DataFrame,
+                          n_boot: int = config.N_BOOTSTRAP) -> pd.DataFrame:
+    """Population-weighted effects with query-cluster percentile intervals.
+
+    The treatment arm is primary. Estimates are emitted marginally and by the
+    prespecified target-admission strata. No arbitrary pass/fail threshold is
+    applied.
+    """
+    if "u00" not in panel.columns:
+        return pd.DataFrame()
+    p = panel[(panel["arm"] == "treatment") & panel["u00"].notna()].copy()
+    if p.empty:
+        return pd.DataFrame()
+    p["bm25_total"] = p["bm25_y11"].astype(int) - p["bm25_y00"].astype(int)
+    p["dense_total"] = p["y11"].astype(int) - p["y00"].astype(int)
+    p["bm25_target_component"] = p["bm25_y10"].astype(int) - p["bm25_y00"].astype(int)
+    p["bm25_competitive_spillover"] = p["bm25_y01"].astype(int) - p["bm25_y00"].astype(int)
+    p["bm25_interaction"] = (p["bm25_y11"].astype(int) - p["bm25_y10"].astype(int)
+                             - p["bm25_y01"].astype(int) + p["bm25_y00"].astype(int))
+    p["dense_target_component"] = p["y10"].astype(int) - p["y00"].astype(int)
+    p["dense_competitive_spillover"] = p["y01"].astype(int) - p["y00"].astype(int)
+    p["dense_interaction"] = (p["y11"].astype(int) - p["y10"].astype(int)
+                              - p["y01"].astype(int) + p["y00"].astype(int))
+    p["hybrid_total"] = p["u11"].astype(int) - p["u00"].astype(int)
+    p["hybrid_target_component"] = p["u10"].astype(int) - p["u00"].astype(int)
+    p["hybrid_competitive_spillover"] = p["u01"].astype(int) - p["u00"].astype(int)
+    p["hybrid_interaction"] = (p["u11"].astype(int) - p["u10"].astype(int)
+                               - p["u01"].astype(int) + p["u00"].astype(int))
+    p["hybrid_shapley_target"] = 0.5 * (
+        p["u10"].astype(int) - p["u00"].astype(int)
+        + p["u11"].astype(int) - p["u01"].astype(int))
+    p["hybrid_shapley_competitors"] = 0.5 * (
+        p["u01"].astype(int) - p["u00"].astype(int)
+        + p["u11"].astype(int) - p["u10"].astype(int))
+    p["hybrid_rescue"] = ((p["u00"] == 0) & (p["u11"] == 1)).astype(int)
+    p["hybrid_displacement"] = ((p["u00"] == 1) & (p["u11"] == 0)).astype(int)
+    p["bm25_changed"] = p["bm25_y11"] != p["bm25_y00"]
+    p["dense_changed"] = p["y11"] != p["y00"]
+    p["hybrid_changed"] = p["u11"] != p["u00"]
+    p["bm25_masked"] = (p["bm25_changed"] & ~p["hybrid_changed"]).astype(int)
+    p["dense_masked"] = (p["dense_changed"] & ~p["hybrid_changed"]).astype(int)
+    p["response_class"] = np.select(
+        [(p["u00"] == 0) & (p["u11"] == 0),
+         (p["u00"] == 0) & (p["u11"] == 1),
+         (p["u00"] == 1) & (p["u11"] == 0)],
+        ["always_out", "rescued", "displaced"], default="always_in")
+    for response in ("always_out", "rescued", "displaced", "always_in"):
+        p[f"response_{response}"] = (p["response_class"] == response).astype(int)
+
+    metrics = ["bm25_total", "bm25_target_component",
+               "bm25_competitive_spillover", "bm25_interaction",
+               "bm25_shapley_target", "bm25_shapley_competitors",
+               "dense_total", "dense_target_component",
+               "dense_competitive_spillover", "dense_interaction",
+               "shapley_target", "shapley_competitors", "hybrid_total",
+               "hybrid_target_component", "hybrid_competitive_spillover",
+               "hybrid_interaction", "hybrid_shapley_target",
+               "hybrid_shapley_competitors", "hybrid_rescue",
+               "hybrid_displacement", "response_always_out",
+               "response_rescued", "response_displaced", "response_always_in"]
+    groups = [("all", p)] + [(str(s), g) for s, g in p.groupby("target_stratum")]
+    rng = np.random.default_rng(config.SEED + 809)
+    recs = []
+    for stratum, g in groups:
+        queries = np.array(sorted(g["query_id"].unique()))
+        if not len(queries):
+            continue
+        for metric in metrics:
+            point = _weighted_mean(g, metric)
+            boots = _weighted_cluster_boot(g, metric, rng, n_boot)
+            recs.append({
+                "target_stratum": stratum, "metric": metric,
+                "estimate": point, "ci_lo": float(np.nanquantile(boots, 0.025)),
+                "ci_hi": float(np.nanquantile(boots, 0.975)), "n": len(g),
+                "n_queries": len(queries), "bootstrap_replicates": n_boot,
+            })
+        for channel in ("bm25", "dense"):
+            changed = g[g[f"{channel}_changed"]]
+            if changed.empty:
+                continue
+            metric = f"{channel}_masking_probability"
+            point = _weighted_mean(changed, f"{channel}_masked")
+            qchanged = np.array(sorted(changed["query_id"].unique()))
+            boots = _weighted_cluster_boot(changed, f"{channel}_masked", rng,
+                                           n_boot)
+            recs.append({
+                "target_stratum": stratum, "metric": metric,
+                "estimate": point, "ci_lo": float(np.nanquantile(boots, 0.025)),
+                "ci_hi": float(np.nanquantile(boots, 0.975)), "n": len(changed),
+                "n_queries": len(qchanged), "bootstrap_replicates": n_boot,
+            })
     return pd.DataFrame(recs)
 
 
@@ -581,12 +723,13 @@ def mechanistic_models(panel: pd.DataFrame) -> pd.DataFrame:
                 continue
             oof = np.full(len(sub), np.nan)
             X = sub[cols].to_numpy(dtype=float)
+            weights = sub.get("analysis_weight", pd.Series(1.0, index=sub.index)).to_numpy(float)
             for tr, te in GroupKFold(n_splits=n_splits).split(X, y, groups):
                 if len(np.unique(y[tr])) < 2:
                     continue
                 m = make_pipeline(StandardScaler(),
                                   LogisticRegression(max_iter=1000, C=1.0))
-                m.fit(X[tr], y[tr])
+                m.fit(X[tr], y[tr], logisticregression__sample_weight=weights[tr])
                 oof[te] = m.predict_proba(X[te])[:, 1]
             ok = ~np.isnan(oof)
             if ok.sum() < 100 or len(np.unique(y[ok])) < 2:
@@ -595,10 +738,10 @@ def mechanistic_models(panel: pd.DataFrame) -> pd.DataFrame:
             recs.append({
                 "task": task, "model": name, "n": int(ok.sum()),
                 "n_features": len(cols), "base_rate": float(yo.mean()),
-                "log_loss": float(log_loss(yo, po)),
-                "brier": float(brier_score_loss(yo, po)),
-                "roc_auc": float(roc_auc_score(yo, po)),
-                "pr_auc": float(average_precision_score(yo, po)),
+                "log_loss": float(log_loss(yo, po, sample_weight=weights[ok])),
+                "brier": float(brier_score_loss(yo, po, sample_weight=weights[ok])),
+                "roc_auc": float(roc_auc_score(yo, po, sample_weight=weights[ok])),
+                "pr_auc": float(average_precision_score(yo, po, sample_weight=weights[ok])),
             })
     return pd.DataFrame(recs)
 
@@ -654,6 +797,12 @@ def main() -> int:
         ug.to_csv(OUT_UNION, index=False)
         print("\nUnion gate (BM25 OR dense):")
         print(ug.to_string(index=False))
+
+    estimates = publication_estimates(panel)
+    if not estimates.empty:
+        estimates.to_csv(OUT_ESTIMATES, index=False)
+        print("\nPopulation-weighted admission estimates:")
+        print(estimates.to_string(index=False))
 
     if not args.no_models:
         models = mechanistic_models(panel)

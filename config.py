@@ -60,8 +60,13 @@ N_QUERIES: int | None = int(_n_env) if _n_env else None
 #: that a code change invalidates cached artefacts.
 _CODE_MODULES = (
     "config.py", "pipeline.py", "interventions.py",
-    "mediation.py", "dml_analysis.py", "stability.py",
+    "admission.py", "dense_admission.py", "run_all.py",
+    "scripts/test_worlds.py", "scripts/check_admission.py",
+    "scripts/meta_analyze.py",
 )
+
+#: Bumped whenever the scientific estimand or artefact contract changes.
+EXPERIMENT_VERSION: str = "admission-v2"
 
 
 def code_fingerprint() -> str:
@@ -150,12 +155,30 @@ MISSING_RANK: int = K_CANDIDATES + 1
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
-DENSE_MODEL: str = "BAAI/bge-small-en-v1.5"
+DENSE_MODEL: str = os.environ.get("DENSE_MODEL", "BAAI/bge-small-en-v1.5").strip()
+DENSE_MODEL_REVISION: str | None = os.environ.get("DENSE_MODEL_REVISION", "").strip() or None
 CROSS_ENCODER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 #: BGE models are trained with an asymmetric query instruction; omitting it
 #: costs several nDCG points. Documents are embedded with no prefix.
 BGE_QUERY_PREFIX: str = "Represent this sentence for searching relevant passages: "
+
+
+def dense_model_adapter(model: str = DENSE_MODEL) -> dict[str, object]:
+    """Pinned preprocessing contract for supported dense retrievers."""
+    if model == "BAAI/bge-small-en-v1.5":
+        return {"query_prefix": BGE_QUERY_PREFIX, "document_prefix": "",
+                "normalize": True}
+    if model == "intfloat/e5-small-v2":
+        return {"query_prefix": "query: ", "document_prefix": "passage: ",
+                "normalize": True}
+    raise ValueError(
+        f"unsupported DENSE_MODEL={model!r}; add an explicit preprocessing "
+        "adapter before using a new checkpoint"
+    )
+
+
+DENSE_ADAPTER: dict[str, object] = dense_model_adapter()
 
 EMBED_BATCH_SIZE: int = _int_env("EMBED_BATCH_SIZE", 256, 64)
 CE_BATCH_SIZE: int = _int_env("CE_BATCH_SIZE", 256, 64)
@@ -194,10 +217,10 @@ ALLOW_TF32: bool = os.environ.get("ALLOW_TF32", "0") == "1"
 #: the same budget compromise as :data:`K_CANDIDATES`. All 323 queries are
 #: retained either way, so the number of bootstrap clusters - which drives CI
 #: width - is unchanged.
-MAX_TARGET_DOCS_PER_QUERY: int = _int_env("MAX_TARGET_DOCS", 10, 3)
+MAX_TARGET_DOCS_PER_QUERY: int = _int_env("MAX_TARGET_DOCS", 10, 10)
 N_TREATMENT_TERMS: int = 3
 N_CONTROL_TERMS: int = 3
-N_BOOTSTRAP: int = 1000
+N_BOOTSTRAP: int = int(os.environ.get("N_BOOTSTRAP", 10_000))
 
 # --- do()-operator term sampling: support x lift ---------------------------
 #
@@ -273,7 +296,11 @@ CACHE_DIR: Path = ROOT / "cache"
 #: writing both to the same directory silently mixes them (a cancelled CPU job
 #: at the default K=20 once overwrote GPU K=50 panels and manufactured 972
 #: impossible union rescues before the K guard caught it).
-RESULTS_SUFFIX: str = os.environ.get("RESULTS_SUFFIX", "").strip()
+_default_results_suffix = (
+    f"_{EXPERIMENT_VERSION}_{DENSE_MODEL.split('/')[-1]}"
+    f"_{(DENSE_MODEL_REVISION or 'unresolved')[:8]}_k{K_CANDIDATES}"
+)
+RESULTS_SUFFIX: str = os.environ.get("RESULTS_SUFFIX", _default_results_suffix).strip()
 RESULTS_ROOT: Path = ROOT / "results"
 RESULTS_DIR: Path = RESULTS_ROOT / (DATASET.replace("/", "-") + RESULTS_SUFFIX)
 
@@ -321,9 +348,10 @@ CORPUS_CACHE: Path = CACHE_DIR / f"corpus_{DATASET_TAG}_v{CORPUS_FORMAT}.pkl"
 #: allocated GPU time, to derive an identical read-only table. Profile-independent:
 #: it depends only on the corpus, not on K, sequence lengths or precision.
 VOCAB_STATS_CACHE: Path = CACHE_DIR / f"vocab_{DATASET_TAG}_v1.pkl"
+BM25_DF_CACHE: Path = CACHE_DIR / f"bm25_df_{DATASET_TAG}_v1.pkl"
 
 
-def baseline_cache_path(qids: list[str]) -> Path:
+def baseline_cache_path(qids: list[str], admission_only: bool = False) -> Path:
     """Cache path for a baseline run set.
 
     Keyed on the *content* of the query list, not its length: under sharding,
@@ -335,6 +363,7 @@ def baseline_cache_path(qids: list[str]) -> Path:
     ).hexdigest()
     return CACHE_DIR / (
         f"baseline_{DATASET_TAG}_n{len(qids)}_{digest}_k{K_CANDIDATES}"
+        f"_{'admission' if admission_only else 'full'}"
         f"_ce{CE_MAX_LENGTH}_d{MAX_SEQ_LENGTH}_{PRECISION_TAG}.pkl"
     )
 
@@ -451,6 +480,7 @@ def device_banner() -> str:
 def summary() -> dict[str, object]:
     """Return the config as a flat dict for the report header."""
     return {
+        "experiment_version": EXPERIMENT_VERSION,
         "seed": SEED,
         "dataset": DATASET,
         "device": DEVICE,
@@ -460,6 +490,8 @@ def summary() -> dict[str, object]:
         "K_FINAL": K_FINAL,
         "ce_max_length": CE_MAX_LENGTH,
         "dense_model": DENSE_MODEL,
+        "dense_model_revision": DENSE_MODEL_REVISION,
+        "dense_adapter": DENSE_ADAPTER,
         "cross_encoder_model": CROSS_ENCODER_MODEL,
         "max_target_docs_per_query": MAX_TARGET_DOCS_PER_QUERY,
         "n_treatment_terms": N_TREATMENT_TERMS,
