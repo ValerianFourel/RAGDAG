@@ -266,8 +266,16 @@ CACHE_DIR: Path = ROOT / "cache"
 #: first: every artefact path (parquets, figures, REPORT.md, run_meta.json) is
 #: a fixed filename, so running SciFact after NFCorpus silently destroyed the
 #: NFCorpus results rather than sitting alongside them.
+#:
+#: ``RESULTS_SUFFIX`` scopes a variant run into its own directory. K sweeps are
+#: the reason it exists: K is the conditioning event *and* the bar, so a K=20
+#: run is a different experiment, not a refinement of the K=50 one - and
+#: writing both to the same directory silently mixes them (a cancelled CPU job
+#: at the default K=20 once overwrote GPU K=50 panels and manufactured 972
+#: impossible union rescues before the K guard caught it).
+RESULTS_SUFFIX: str = os.environ.get("RESULTS_SUFFIX", "").strip()
 RESULTS_ROOT: Path = ROOT / "results"
-RESULTS_DIR: Path = RESULTS_ROOT / DATASET.replace("/", "-")
+RESULTS_DIR: Path = RESULTS_ROOT / (DATASET.replace("/", "-") + RESULTS_SUFFIX)
 
 CACHE_DIR.mkdir(exist_ok=True)
 RESULTS_ROOT.mkdir(exist_ok=True)
