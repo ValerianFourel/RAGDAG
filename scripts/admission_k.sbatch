@@ -13,8 +13,8 @@
 #   sbatch --export=ALL,RAGDAG_WS="$RAGDAG_WS",K_CANDIDATES=20,RESULTS_SUFFIX=_k20 \
 #          scripts/admission_k.sbatch
 #
-#   # a subset of collections
-#   sbatch --export=ALL,...,DATASETS="beir/nfcorpus/test beir/scifact/test" \
+#   # a subset of collections (RAGDAG_DATASETS, *not* DATASETS - see below)
+#   sbatch --export=ALL,...,RAGDAG_DATASETS="beir/nfcorpus/test beir/scifact/test" \
 #          scripts/admission_k.sbatch
 #
 # Why K must be passed explicitly: config defaults it to 50 on a GPU node and
@@ -57,13 +57,25 @@ fi
 export K_CANDIDATES
 export RESULTS_SUFFIX="${RESULTS_SUFFIX:-}"
 
-DATASETS="${DATASETS:-beir/nfcorpus/test beir/scifact/test beir/trec-covid beir/fiqa/test beir/scidocs beir/quora/test}"
+# NOT named DATASETS: HoreKa exports DATASETS=/hkfs/home/dataset/datasets
+# system-wide, and --export=ALL inherits it, so a ${DATASETS:-default} would
+# silently iterate over that path instead of the collections (it did once).
+RAGDAG_DATASETS="${RAGDAG_DATASETS:-beir/nfcorpus/test beir/scifact/test beir/trec-covid beir/fiqa/test beir/scidocs beir/quora/test}"
+for _ds in $RAGDAG_DATASETS; do
+  case "$_ds" in
+    */*) : ;;                       # a dataset id, e.g. beir/nfcorpus/test
+    *) echo "refusing to run: '$_ds' is not a dataset id - set RAGDAG_DATASETS" >&2
+       exit 2 ;;
+  esac
+  [ -e "$_ds" ] && { echo "refusing to run: '$_ds' is a filesystem path, not a"
+                     echo "dataset id - a stray DATASETS/RAGDAG_DATASETS leaked in." >&2; exit 2; }
+done
 
 echo "=================================================================="
 echo "RAGDAG admission  K=$K_CANDIDATES  suffix='${RESULTS_SUFFIX}'"
 echo "  node        $(hostname)"
 echo "  started     $(date)"
-echo "  datasets    $DATASETS"
+echo "  datasets    $RAGDAG_DATASETS"
 echo "=================================================================="
 
 python scripts/test_worlds.py || { echo "unit tests failed - aborting"; exit 1; }
@@ -72,7 +84,7 @@ python scripts/test_worlds.py || { echo "unit tests failed - aborting"; exit 1; 
 # log from the primary run. The sampled do() operations are deliberately held
 # fixed across K: only the bar changes, which is the whole point of the sweep.
 if [ -n "$RESULTS_SUFFIX" ]; then
-  for ds in $DATASETS; do
+  for ds in $RAGDAG_DATASETS; do
     tag="${ds//\//-}"
     src="results/${tag}/interventions.parquet"
     dst="results/${tag}${RESULTS_SUFFIX}"
@@ -86,7 +98,7 @@ if [ -n "$RESULTS_SUFFIX" ]; then
 fi
 
 failed=""
-for ds in $DATASETS; do
+for ds in $RAGDAG_DATASETS; do
   echo ""
   echo "# dataset: $ds   $(date +%H:%M:%S)"
   DATASET="$ds" python -m run_all --merge --n-shards 4 --only 7 8 \
