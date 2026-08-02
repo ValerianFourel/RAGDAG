@@ -9,7 +9,13 @@ Checks, per results directory:
   outside both channels' top-K, which is impossible since targets are drawn
   from the union pool);
 * both closed-form audits pass;
-* ``both_missed`` is zero (the observable symptom of the above);
+* ``both_missed`` is zero **when the analysis K is at least the K the
+  interventions were sampled at** (default 50, override with
+  ``--interventions-k``). Targets are drawn from the top-K BM25 union top-K
+  dense pool at sampling time, so at a shallower analysis K a target that sat
+  at, say, BM25 rank 35 is legitimately outside both top-20 lists - there
+  ``both_missed`` is a measurement (how many targets a shallower pool loses),
+  not a defect;
 * the lexical immunity certificate has zero violations - margin greater than
   the largest possible competitor boost must imply the target is never ejected.
 
@@ -34,6 +40,13 @@ def _load(path: str):
 
 
 def main() -> int:
+    import argparse
+
+    ap_ = argparse.ArgumentParser(description=__doc__)
+    ap_.add_argument("--interventions-k", type=int, default=50,
+                     help="pool depth the do() trials were sampled at (default 50)")
+    args = ap_.parse_args()
+
     rows, problems = [], []
     for d in sorted(glob.glob("results/beir-*")):
         ap = os.path.join(d, "admission_panel.parquet")
@@ -81,8 +94,14 @@ def main() -> int:
         elif r["denseK"] is not None and r["lexK"] != r["denseK"]:
             problems.append(f"{name}: K mismatch lex={r['lexK']} dense={r['denseK']}")
         if isinstance(r["both_missed"], int) and r["both_missed"]:
-            problems.append(f"{name}: {r['both_missed']} rows outside BOTH channels "
-                            "(impossible - targets come from the union pool)")
+            if r["lexK"] is not None and int(r["lexK"]) < args.interventions_k:
+                # Expected: the trials were sampled from a deeper pool, so some
+                # targets fall outside a shallower one. Report, do not fail.
+                r["both_missed"] = f"{r['both_missed']} (exp. K<{args.interventions_k})"
+            else:
+                problems.append(f"{name}: {r['both_missed']} rows outside BOTH channels "
+                                "(impossible - targets come from the union pool "
+                                f"at K={args.interventions_k})")
         if r["immune_viol"]:
             problems.append(f"{name}: {r['immune_viol']} immunity-certificate violations")
         rows.append(r)
