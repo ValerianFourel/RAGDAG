@@ -469,6 +469,11 @@ def audit_predictor(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) 
         "tolerance": tol,
         "admission_agreement": adm_agree / max(1, checked),
         "exact": bool(worst_score <= tol),
+        # Recorded because K is profile-dependent (50 on GPU, 20 on CPU) and it
+        # sets both the conditioning event and the bar: a panel built under a
+        # different K is not comparable and must not be joined to this one.
+        "k_candidates": int(config.K_CANDIDATES),
+        "dataset": config.DATASET,
     }
     print(f"[admission] predictor audit: {checked} injections, "
           f"max |score error| = {worst_score:.3e} (tol {tol:.3e}), "

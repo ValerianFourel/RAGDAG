@@ -272,6 +272,8 @@ def audit_dense(pipe: RetrievalPipeline, inter: pd.DataFrame, n: int = 200) -> d
         "reference_dtype": "float64 over cached float32 embeddings",
         "production_dtype": "float32",
         "exact": bool(max_rel < 1e-9 and cs_viol == 0),
+        "k_candidates": int(config.K_CANDIDATES),
+        "dataset": config.DATASET,
     }
     print(f"[dense_admission] audit: {checked} injections, "
           f"identity err {max_abs:.3e} (rel {max_rel:.3e}), "
@@ -407,6 +409,27 @@ def join_lexical(panel: pd.DataFrame) -> pd.DataFrame:
 
     if not A.OUT_PANEL.exists():
         print("[dense_admission] no admission_panel.parquet - skipping lexical join")
+        return panel
+    # K is profile-dependent (50 on GPU, 20 on CPU) and sets the bar itself, so
+    # a stage-7 panel built under a different K describes a different
+    # conditioning event. Joining the two silently manufactures documents that
+    # appear to be outside *both* top-K lists - impossible, since targets are
+    # drawn from the union pool. Refuse rather than produce that artefact.
+    lex_k = None
+    if A.OUT_AUDIT.exists():
+        try:
+            lex_k = json.loads(A.OUT_AUDIT.read_text()).get("k_candidates")
+        except Exception:  # noqa: BLE001
+            lex_k = None
+    if lex_k is None:
+        print("[dense_admission] WARNING: the lexical audit records no "
+              "k_candidates (panel predates the guard). Verify both panels were "
+              "built at K=%d before trusting union-gate numbers."
+              % config.K_CANDIDATES)
+    elif int(lex_k) != int(config.K_CANDIDATES):
+        print(f"[dense_admission] REFUSING lexical join: admission_panel was "
+              f"built at K={lex_k}, this run is K={config.K_CANDIDATES}. "
+              f"Re-run stage 7 at the same K.")
         return panel
     lex = pd.read_parquet(A.OUT_PANEL)
     cols = ["query_id", "doc_id", "term", "arm", "support", "lift", "idf",
