@@ -9,7 +9,14 @@ Scope is deliberately the **lexical channel only**, because there BM25 gives an
 exact closed form and the whole analysis can be validated rather than fitted::
 
     A = 1{d in TopK(BM25)}          the outcome
-    delta(t, d') = IDF(t) * tf(t,d')(k1+1) / (tf(t,d') + k1(1 - b + b|d'|/avgdl))
+    delta(t, d') = IDF(t) * tf(t,d') / (tf(t,d') + k1(1 - b + b|d'|/avgdl))
+    IDF(t)       = log(1 + (N - df(t) + 0.5) / (df(t) + 0.5))
+
+**No ``(k1+1)`` numerator factor**: the index is bm25s' ``lucene`` variant,
+which omits it. See `bm25_delta`. One consequence is load-bearing downstream:
+the saturation ratio is strictly below 1, so ``delta(t, d') < IDF(t)`` for
+every document - which is the immunity certificate a target with
+``margin > IDF(t)`` cannot be displaced by any competitor gaining ``t``.
 
 Appending a term ``t`` to a query changes the BM25 score of *exactly* the
 ``df(t)`` documents containing ``t``, by that amount, and of no others. So the
