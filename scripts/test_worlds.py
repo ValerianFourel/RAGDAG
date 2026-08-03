@@ -160,20 +160,25 @@ def test_shapley_identity() -> None:
 
 
 def test_population_target_sampling() -> None:
+    # Keep the synthetic corpus long enough to populate ``deep_out`` under
+    # both the CPU (K=20) and GPU (K=50) profiles.  With only 100 documents
+    # the worst GPU-profile margin was 50 - 100 == -50, which is ``mid_out``;
+    # the test therefore made an impossible demand for a ``deep_out`` row.
+    n_docs = 200
     class Corpus:
-        doc_ids = [f"d{i:03d}" for i in range(100)]
+        doc_ids = [f"d{i:03d}" for i in range(n_docs)]
         doc_index = {d: i for i, d in enumerate(doc_ids)}
         def __len__(self): return len(self.doc_ids)
         def idx(self, doc_id): return self.doc_index[doc_id]
     class Pipe:
         corpus = Corpus()
-        def _bm25_array(self, query): return np.arange(100, 0, -1, dtype=float)
-        def _dense_array(self, query): return np.arange(100, 0, -1, dtype=float)
+        def _bm25_array(self, query): return np.arange(n_docs, 0, -1, dtype=float)
+        def _dense_array(self, query): return np.arange(n_docs, 0, -1, dtype=float)
     relevant = set(Pipe.corpus.doc_ids) | {"not-in-corpus"}
     frame = interventions.select_targets(Pipe(), "q", relevant,
                                          np.random.default_rng(19), return_frame=True)
     selected = [r for r in frame if r["target_selected"]]
-    assert len(frame) == 100                 # out-of-union qrels remain eligible
+    assert len(frame) == n_docs              # out-of-union qrels remain eligible
     assert len(selected) <= 10               # at most two per five strata
     assert all(0 < r["target_select_prob"] <= 1 for r in frame)
     assert {r["target_stratum"] for r in frame} >= {
