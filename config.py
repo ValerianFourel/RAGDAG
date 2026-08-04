@@ -60,7 +60,7 @@ N_QUERIES: int | None = int(_n_env) if _n_env else None
 #: that a code change invalidates cached artefacts.
 _CODE_MODULES = (
     "config.py", "pipeline.py", "interventions.py",
-    "admission.py", "dense_admission.py", "run_all.py",
+    "admission.py", "dense_admission.py", "architecture_admission.py", "run_all.py",
     "scripts/test_worlds.py", "scripts/check_admission.py",
     "scripts/meta_analyze.py",
 )

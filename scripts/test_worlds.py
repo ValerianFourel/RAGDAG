@@ -159,6 +159,21 @@ def test_shapley_identity() -> None:
     print("ok  Shapley allocations reconstruct every binary four-world total")
 
 
+def test_architecture_operators() -> None:
+    from architecture_admission import Architecture, four_worlds, topk
+
+    b = np.array([9., 8., 7., 6., 5.])
+    d = np.array([5., 6., 7., 8., 9.])
+    assert topk(np.array([1., 1., 1.]), 2).tolist() == [0, 1]
+    # A narrow cascade cannot recover a target censored by its first stage.
+    assert not Architecture("x", "bm25_then_dense", 2).admitted(b, d, 4)
+    assert Architecture("x", "dense_then_bm25", 2).admitted(b, d, 4)
+    # Channel Shapley values always reconstruct the architecture-level change.
+    w = four_worlds(Architecture("u", "union"), b, b[::-1], d, d[::-1], 0)
+    assert w["lexical_shapley"] + w["dense_shapley"] == w["total_change"]
+    print("ok  architecture union/fusion/cascades and channel Shapley identity")
+
+
 def test_population_target_sampling() -> None:
     # Keep the synthetic corpus long enough to populate ``deep_out`` under
     # both the CPU (K=20) and GPU (K=50) profiles.  With only 100 documents
@@ -218,6 +233,7 @@ if __name__ == "__main__":
     test_union_gate()
     test_lexical_admitted_regression()
     test_shapley_identity()
+    test_architecture_operators()
     test_population_target_sampling()
     test_weighted_publication_estimate()
     print("\nALL WORLD TESTS PASSED")

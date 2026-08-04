@@ -388,3 +388,18 @@ DML standard errors treat
 query-clustered — this makes the confounding test conservative in the direction
 of *not* flagging disagreement. And this is one dataset with one model pair:
 nothing here shows the mediation shares transfer to other corpora or rerankers.
+
+### Architecture robustness experiment
+
+After the admission intervention artefacts exist, evaluate the same trials
+under parallel union, weighted reciprocal-rank fusion, and both cascade orders:
+
+```bash
+DATASET=beir/nfcorpus/test K_CANDIDATES=50 python -m architecture_admission --limit 20 --no-bootstrap
+sbatch --export=ALL,RAGDAG_WS="$RAGDAG_WS",BGE_REVISION="$BGE_REVISION",E5_REVISION="$E5_REVISION" scripts/architecture_spectrum.sbatch
+```
+
+The fusion grid is controlled by `ARCH_FUSION_LAMBDAS`, cascade first-stage
+budgets by `ARCH_CASCADE_BUDGETS`, final admission depth by `ARCH_FINAL_K`, and
+cluster-bootstrap repetitions by `ARCH_N_BOOTSTRAP`. Results are written beside
+each dataset/model's existing admission artefacts.
