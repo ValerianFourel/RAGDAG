@@ -30,7 +30,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+# Four shard processes each hold the collection in memory.  Quora has 522,931
+# documents and exceeded 64 GB (job 5042903 peaked at 63.98 GB before three
+# workers were OOM-killed), so reserve sufficient host RAM for the full matrix.
+#SBATCH --mem=256G
 #SBATCH --time=01:30:00
 #SBATCH --output=logs/ragdag-adm-%j.out
 #SBATCH --error=logs/ragdag-adm-%j.out

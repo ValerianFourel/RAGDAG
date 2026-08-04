@@ -49,7 +49,10 @@ N_GPUS="${#DEVS[@]}"
 PY="${PYTHON:-python}"
 export TOKENIZERS_PARALLELISM=false
 # Each worker gets one GPU and should not also try to grab every CPU core.
-TOTAL_CPUS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
+# Honour the scheduler allocation.  ``getconf`` reports every physical core on
+# a HoreKa node (152), not the cores granted to this job (normally 8); using it
+# made four workers create 38 Torch threads each and oversubscribe the node.
+TOTAL_CPUS="${SLURM_CPUS_PER_TASK:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 export N_TORCH_THREADS="${N_TORCH_THREADS:-$(( TOTAL_CPUS / N_GPUS > 0 ? TOTAL_CPUS / N_GPUS : 1 ))}"
 
 DS_TAG=$(${PY:-python} -c "import config; print(config.RESULTS_DIR.name)" 2>/dev/null || echo default)
